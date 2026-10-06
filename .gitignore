@@ -1,0 +1,17 @@
+/.gradle/
+/**/build/
+/local.properties
+/dist/
+/docs/test-evidence/
+*.apk
+*.apk.idsig
+*.jks
+*.keystore
+*.p12
+*.pem
+/.env*
+/signing.properties
+/credentials*.json
+/client_secret*.json
+/.idea/
+
