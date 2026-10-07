@@ -6,6 +6,24 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class AppUpdatesTest {
+    @Test fun quotaFailureUsesPublicMetadataWithoutCredentials() {
+        val server = com.sun.net.httpserver.HttpServer.create(java.net.InetSocketAddress("127.0.0.1", 0), 0)
+        var fallbackCalls = 0
+        server.createContext("/api") { it.sendResponseHeaders(403, -1); it.close() }
+        server.createContext("/fallback") { exchange ->
+            fallbackCalls++
+            assertNull(exchange.requestHeaders.getFirst("Authorization"))
+            val data = """[{"tag_name":"v0.8.61","html_url":"$APP_REPOSITORY/releases/tag/v0.8.61","assets":[{"name":"MAGLE.apk","browser_download_url":"$APP_REPOSITORY/releases/download/v0.8.61/MAGLE.apk","size":123}]}]""".toByteArray()
+            exchange.sendResponseHeaders(200, data.size.toLong()); exchange.responseBody.use { it.write(data) }
+        }
+        server.start()
+        try {
+            val root = "http://127.0.0.1:${server.address.port}"
+            assertEquals("v0.8.61", fetchAppRelease("0.8.59", listOf("$root/api", "$root/fallback"))!!.version)
+            assertEquals(1, fallbackCalls)
+            assertTrue(runCatching { fetchAppRelease("0.8.59", listOf("$root/api", "$root/api")) }.isFailure)
+        } finally { server.stop(0) }
+    }
     @Test fun aboutHasOnlyTwoRowsAndNoStartupUpdateRequest() {
         val source = java.io.File("src/main/java/com/tai/oeviewer/MainActivity.kt").readText()
         val about = source.substringAfter("private fun SettingsAbout()").substringBefore("private fun openProjectPage")

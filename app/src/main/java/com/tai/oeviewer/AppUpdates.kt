@@ -4,6 +4,31 @@ import org.json.JSONArray
 
 internal const val APP_REPOSITORY = "https://github.com/Ten-W/MAGLE"
 internal const val APP_RELEASES_API = "https://api.github.com/repos/Ten-W/MAGLE/releases?per_page=100"
+internal const val APP_RELEASES_FALLBACK = "https://raw.githubusercontent.com/Ten-W/MAGLE/main/update.json"
+
+internal fun fetchAppRelease(currentVersion: String, urls: List<String> = listOf(APP_RELEASES_API, APP_RELEASES_FALLBACK)): AppRelease? {
+    val client = okhttp3.OkHttpClient.Builder().callTimeout(15, java.util.concurrent.TimeUnit.SECONDS).build()
+    var failure: Exception? = null
+    for (url in urls) {
+        try {
+            client.newCall(okhttp3.Request.Builder().url(url).header("User-Agent", "MAGLE/$currentVersion").build()).execute().use { response ->
+                check(response.isSuccessful) { "检查失败：HTTP ${response.code}" }
+                val bytes = response.body!!.byteStream().use { input ->
+                    val output = java.io.ByteArrayOutputStream()
+                    val buffer = ByteArray(8192)
+                    while (true) {
+                        val size = input.read(buffer); if (size < 0) break
+                        check(output.size() + size <= 1024 * 1024) { "更新信息过大" }
+                        output.write(buffer, 0, size)
+                    }
+                    output.toByteArray()
+                }
+                return newerAppRelease(JSONArray(String(bytes, Charsets.UTF_8)), currentVersion)
+            }
+        } catch (error: Exception) { failure = error }
+    }
+    throw java.io.IOException("无法检查更新，请检查网络后重试", failure)
+}
 internal data class AppRelease(val version: String, val notes: String, val page: String,
     val apkUrl: String, val size: Long, val digest: String)
 

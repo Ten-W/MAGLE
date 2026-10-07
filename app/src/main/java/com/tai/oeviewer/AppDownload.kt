@@ -11,7 +11,7 @@ import java.io.File
 
 internal data class AppDownloadState(val button: String = "立即更新", val message: String = "", val busy: Boolean = false)
 
-// Android owns the transfer, including network retries and persistence across app restarts.
+// Transfer runs under MAGLE's UID, not the vendor's system download component.
 internal class AppDownload(private val context: Context) {
     private val prefs = context.getSharedPreferences("app-download", Context.MODE_PRIVATE)
     private val manager = context.getSystemService(DownloadManager::class.java)
@@ -23,45 +23,40 @@ internal class AppDownload(private val context: Context) {
         AppRelease(version, "", "$APP_REPOSITORY/releases/tag/$version",
             prefs.getString("url", "")!!, prefs.getLong("size", 0), prefs.getString("digest", "")!!)
     }
-    private fun file(release: AppRelease) = File(context.getExternalFilesDir(null), "updates/MAGLE-${release.version}.apk")
+    internal fun file(release: AppRelease) = File(context.getExternalFilesDir(null), "updates/MAGLE-${release.version}.apk")
     fun clear() {
+        context.stopService(Intent(context, AppDownloadService::class.java))
         val id = prefs.getLong("id", -1)
         if (id != -1L) manager.remove(id)
         prefs.getString("version", null)?.takeIf { versionParts(it) != null }?.let {
             File(context.getExternalFilesDir(null), "updates/MAGLE-$it.apk").delete()
+            File(context.getExternalFilesDir(null), "updates/MAGLE-$it.apk.part").delete()
         }
         prefs.edit().clear().commit()
     }
     fun start(release: AppRelease) {
         require(versionParts(release.version) != null && release.apkUrl.startsWith("$APP_REPOSITORY/releases/download/${release.version}/"))
-        if (savedRelease()?.version == release.version && state().busy) return
-        clear()
-        val request = DownloadManager.Request(Uri.parse(release.apkUrl))
-            .setTitle("MAGLE ${release.version}").setMimeType("application/vnd.android.package-archive")
-            .setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
-            .setDestinationInExternalFilesDir(context, null, "updates/MAGLE-${release.version}.apk")
-        val id = manager.enqueue(request)
-        prefs.edit().putLong("id", id).putString("version", release.version).putString("url", release.apkUrl)
+        if (state().busy) return
+        val same = prefs.getString("url", "") == release.apkUrl && prefs.getLong("size", 0) == release.size &&
+            prefs.getString("digest", "") == release.digest
+        if (!same) clear()
+        val oldId = prefs.getLong("id", -1)
+        if (oldId != -1L) manager.remove(oldId)
+        prefs.edit().remove("id").putString("version", release.version).putString("url", release.apkUrl)
             .putLong("size", release.size).putString("digest", release.digest).commit()
+        androidx.core.content.ContextCompat.startForegroundService(context, Intent(context, AppDownloadService::class.java))
     }
     fun state(): AppDownloadState {
-        val id = prefs.getLong("id", -1)
-        if (id == -1L) return AppDownloadState()
-        manager.query(DownloadManager.Query().setFilterById(id)).use { cursor ->
-            if (!cursor.moveToFirst()) return AppDownloadState("重新下载", "下载任务已失效")
-            fun number(column: String) = cursor.getLong(cursor.getColumnIndexOrThrow(column))
-            return when (number(DownloadManager.COLUMN_STATUS).toInt()) {
-                DownloadManager.STATUS_SUCCESSFUL -> AppDownloadState("安装更新", "下载完成，点击安装")
-                DownloadManager.STATUS_FAILED -> AppDownloadState("重新下载", "下载失败，可重试（错误 ${number(DownloadManager.COLUMN_REASON)}）")
-                else -> {
-                    val total = number(DownloadManager.COLUMN_TOTAL_SIZE_BYTES)
-                    val bytes = number(DownloadManager.COLUMN_BYTES_DOWNLOADED_SO_FAR)
-                    val paused = number(DownloadManager.COLUMN_STATUS).toInt() == DownloadManager.STATUS_PAUSED
-                    AppDownloadState(if (total > 0) "${(bytes * 100 / total).coerceIn(0, 100)}%" else "下载中",
-                        if (paused) "等待网络恢复，系统会继续下载" else "正在后台下载", true)
-                }
-            }
+        val version = prefs.getString("version", null) ?: return AppDownloadState()
+        if (versionParts(version) == null) return AppDownloadState()
+        val target = File(context.getExternalFilesDir(null), "updates/MAGLE-$version.apk")
+        if (prefs.getBoolean("complete", false) && target.isFile) return AppDownloadState("安装更新", "下载完成，点击安装")
+        if (AppDownloadService.running) {
+            val bytes = File(target.path + ".part").length()
+            val total = prefs.getLong("size", 0)
+            return AppDownloadState(if (total > 0) "${(bytes * 100 / total).coerceIn(0, 100)}%" else "下载中", "正在后台下载", true)
         }
+        return AppDownloadState("继续下载", prefs.getString("error", null) ?: "下载中断，点击继续下载")
     }
     @Suppress("DEPRECATION")
     fun validate(release: AppRelease) {

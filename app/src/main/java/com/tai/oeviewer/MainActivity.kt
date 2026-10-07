@@ -101,6 +101,8 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.animation.core.animateDpAsState
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.ui.draw.rotate
 import androidx.compose.animation.animateContentSize
 import androidx.compose.animation.expandIn
 import androidx.compose.animation.fadeIn
@@ -455,6 +457,12 @@ class MainActivity : ComponentActivity() {
     private var newSourceForLibrary: SavedLibrary? = null
     private var exportIndexChooser by mutableStateOf(false)
     private var exportIndexLibrary: SavedLibrary? = null
+    private var exportIndexLibraries: List<SavedLibrary> = emptyList()
+    private val exportIndexesPicker = registerForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
+        val libraries = exportIndexLibraries
+        exportIndexLibraries = emptyList()
+        if (uri != null && libraries.isNotEmpty()) exportIndexes(libraries, uri)
+    }
     private var importedIndex: ImportedIndex? = null
     private val exportIndexPicker = registerForActivityResult(ActivityResultContracts.CreateDocument("application/zip")) { uri ->
         val saved = exportIndexLibrary
@@ -2682,28 +2690,7 @@ class MainActivity : ComponentActivity() {
         lifecycleScope.launch {
             try {
                 val release = withContext(Dispatchers.IO) {
-                    val request = (URL(APP_RELEASES_API).openConnection() as HttpURLConnection).apply {
-                        connectTimeout = 10_000; readTimeout = 10_000
-                        setRequestProperty("Accept", "application/vnd.github+json")
-                        setRequestProperty("User-Agent", "MAGLE/${BuildConfig.VERSION_NAME}")
-                    }
-                    try {
-                        val code = request.responseCode
-                        if (code == 404) throw java.io.IOException("无法读取更新：仓库可能为私有或发布信息不可访问，可前往 GitHub 查看")
-                        if (code != 200) throw java.io.IOException("检查失败：HTTP $code，请稍后重试")
-                        val bytes = request.inputStream.use { input ->
-                            val output = java.io.ByteArrayOutputStream()
-                            val buffer = ByteArray(8192)
-                            while (true) {
-                                val count = input.read(buffer)
-                                if (count < 0) break
-                                check(output.size() + count <= 1024 * 1024) { "更新信息过大" }
-                                output.write(buffer, 0, count)
-                            }
-                            output.toByteArray()
-                        }
-                        newerAppRelease(JSONArray(String(bytes, StandardCharsets.UTF_8)), BuildConfig.VERSION_NAME)
-                    } finally { request.disconnect() }
+                    fetchAppRelease(BuildConfig.VERSION_NAME)
                 }
                 appRelease = release
                 appUpdateStatus = if (release == null) "当前已是最新版本" else "发现新版本 ${release.version}"
@@ -2723,18 +2710,38 @@ class MainActivity : ComponentActivity() {
                     Row(
                         Modifier.fillMaxWidth().height(48.dp),
                         verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        horizontalArrangement = Arrangement.spacedBy(0.dp)
                     ) {
                         Text(
                             "素材库",
                             style = MaterialTheme.typography.titleMedium,
                             modifier = Modifier.weight(1f)
                         )
+                        IconButton(onClick = { updateCurrentIndex(fullScan = true) }, modifier = Modifier.size(48.dp),
+                            enabled = savedLibraries.isNotEmpty() && libraryLoaded && !indexing && !batchBusy && !remoteConnecting && !sessionRestoring &&
+                                (source != LibrarySource.ONEDRIVE || connected)) {
+                            val rotation = if (indexing) {
+                                val transition = androidx.compose.animation.core.rememberInfiniteTransition(label = "index-sync")
+                                val angle by transition.animateFloat(0f, 360f,
+                                    androidx.compose.animation.core.infiniteRepeatable(tween(1000, easing = androidx.compose.animation.core.LinearEasing)),
+                                    label = "index-sync-angle")
+                                angle
+                            } else 0f
+                            Icon(painterResource(R.drawable.ic_sync_24), contentDescription = "更新当前库索引",
+                                modifier = Modifier.size(22.dp).rotate(rotation))
+                        }
+                        IconButton(onClick = {
+                            if (savedLibraries.size == 1) beginIndexExport(savedLibraries) else exportIndexChooser = true
+                        }, modifier = Modifier.size(48.dp), enabled = savedLibraries.any { saved -> savedIndexes.any { it.libraryId == saved.id } } &&
+                            !indexing && !batchBusy && !remoteConnecting && !sessionRestoring) {
+                            Icon(painterResource(R.drawable.ic_download_24), contentDescription = "导出索引备份", modifier = Modifier.size(22.dp))
+                        }
                         IconButton(
                             onClick = { sourceChooserOpen = true },
+                            modifier = Modifier.size(48.dp),
                             enabled = !indexing && !remoteConnecting && !batchBusy
                         ) {
-                            Icon(Icons.Default.Add, contentDescription = "添加素材库")
+                            Icon(Icons.Default.Add, contentDescription = "添加素材库", modifier = Modifier.size(22.dp))
                         }
                     }
                 if (savedLibraries.isEmpty()) {
@@ -2748,7 +2755,7 @@ class MainActivity : ComponentActivity() {
                         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerHigh)
                     ) {
                         Box(Modifier.fillMaxWidth().padding(18.dp)) {
-                            Column(Modifier.fillMaxWidth().padding(end = 112.dp)) {
+                            Column(Modifier.fillMaxWidth().padding(end = 76.dp)) {
                                 Text(saved.name, style = MaterialTheme.typography.titleMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
                                 Text(
                                     "${saved.source.label} 库" +
@@ -2794,11 +2801,6 @@ class MainActivity : ComponentActivity() {
                             Row(Modifier.align(Alignment.BottomEnd)) {
                                 IconButton(onClick = { editLibraryCandidate = saved }, modifier = Modifier.size(36.dp)) {
                                     Icon(Icons.Default.Edit, contentDescription = "修改素材库", modifier = Modifier.size(19.dp))
-                                }
-                                IconButton(onClick = { exportIndexLibrary = saved; exportIndexChooser = true },
-                                    enabled = !indexing && !batchBusy && !remoteConnecting && !sessionRestoring &&
-                                        savedIndexes.any { it.libraryId == saved.id }, modifier = Modifier.size(36.dp)) {
-                                    Icon(painterResource(R.drawable.ic_download_24), contentDescription = "导出索引备份", modifier = Modifier.size(19.dp))
                                 }
                                 IconButton(onClick = { removeLibraryCandidate = saved }, enabled = !indexing && !batchBusy, modifier = Modifier.size(36.dp)) {
                                     Icon(Icons.Default.Delete, contentDescription = "移除素材库", modifier = Modifier.size(19.dp))
@@ -2907,17 +2909,6 @@ class MainActivity : ComponentActivity() {
                                     updateIntervalMinutes = it
                                     getSharedPreferences("index-sync", MODE_PRIVATE).edit().putInt("interval", it).apply()
                                 })
-                            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
-                            ListItem(
-                                colors = ListItemDefaults.colors(containerColor = androidx.compose.ui.graphics.Color.Transparent),
-                                headlineContent = { Text("更新当前库索引") },
-                                supportingContent = { Text("完整检查当前库目录，包括未记录在变更清单中的素材；也可在视图界面下拉检查更新") },
-                                trailingContent = {
-                                    TextButton(onClick = { updateCurrentIndex(fullScan = true) },
-                                        enabled = libraryLoaded && !indexing && !batchBusy && !remoteConnecting && (source != LibrarySource.ONEDRIVE || connected)
-                                    ) { Text(if (indexing) "更新中…" else "更新") }
-                                }
-                            )
                         }
                     }
                     if (uploadCandidates.isNotEmpty()) Text("已接收 ${uploadCandidates.size} 张待上传图片，请打开可写的本地库或连接 OneDrive、SMB、WebDAV 库。", modifier = Modifier.padding(8.dp))
@@ -2926,15 +2917,75 @@ class MainActivity : ComponentActivity() {
 
     @Composable
     private fun ExportIndexDialog() {
-        val saved = exportIndexLibrary ?: return
-        AlertDialog(onDismissRequest = { exportIndexChooser = false }, title = { Text("导出索引备份 · ${saved.name}") },
-            text = { Text("备份这个库的索引、目录、标签及已有缩略图，不含原文件与登录凭据。未完成的索引不会自动补下载。") },
+        var selected by remember { mutableStateOf(setOf<String>()) }
+        AlertDialog(onDismissRequest = { exportIndexChooser = false }, title = { Text("选择要备份的素材库") },
+            text = { Column {
+                Text("备份索引、目录、标签及已有缩略图，不含原文件和登录凭据。多库备份分别保存到所选目录。")
+                LazyColumn(Modifier.heightIn(max = 320.dp)) {
+                    items(savedLibraries, key = { it.id }) { saved ->
+                        val available = savedIndexes.any { it.libraryId == saved.id }
+                        Row(Modifier.fillMaxWidth().toggleable(saved.id in selected, enabled = available,
+                            role = androidx.compose.ui.semantics.Role.Checkbox, onValueChange = {
+                                selected = if (it) selected + saved.id else selected - saved.id
+                            }).padding(vertical = 10.dp), verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                            PickerCheckbox(saved.id in selected)
+                            Text(saved.name + if (available) "" else " · 尚无索引",
+                                color = if (available) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                    }
+                }
+            } },
             confirmButton = { TextButton(onClick = {
                 exportIndexChooser = false
-                exportIndexLibrary = saved
-                exportIndexPicker.launch("${saved.name.replace(Regex("[\\\\/:*?\"<>|]"), "_")}.magle-index.zip")
-            }) { Text("确认导出") } },
+                beginIndexExport(savedLibraries.filter { it.id in selected })
+            }, enabled = selected.isNotEmpty()) { Text("确认导出") } },
             dismissButton = { TextButton(onClick = { exportIndexChooser = false }) { Text("取消") } })
+    }
+
+    private fun beginIndexExport(libraries: List<SavedLibrary>) {
+        if (libraries.size == 1) {
+            exportIndexLibrary = libraries.single()
+            exportIndexPicker.launch("${libraries.single().name.replace(Regex("[\\\\/:*?\"<>|]"), "_")}.magle-index.zip")
+        } else if (libraries.isNotEmpty()) {
+            exportIndexLibraries = libraries
+            exportIndexesPicker.launch(null)
+        }
+    }
+
+    private fun writeLibraryIndex(saved: SavedLibrary, uri: Uri) {
+        val temporary = File(cacheDir, "index-export-${java.util.UUID.randomUUID()}.zip")
+        try {
+            val index = JSONObject(File(filesDir, "eagle-index-${saved.id.hashCode()}.json").readText())
+            val folders = JSONObject(File(filesDir, "eagle-folders-${saved.id.hashCode()}.json").readText())
+            temporary.outputStream().use { output ->
+                writeIndexBackup(output, index, folders) { id, mtime ->
+                    File(File(cacheDir, "session-thumbnails"), LibraryLogic.thumbnailCacheKey(saved.id, id, mtime))
+                }
+            }
+            contentResolver.openOutputStream(uri, "wt")!!.use { output -> temporary.inputStream().use { it.copyTo(output) } }
+        } finally { temporary.delete() }
+    }
+
+    private fun exportIndexes(libraries: List<SavedLibrary>, uri: Uri) {
+        if (indexing || batchBusy || remoteConnecting || sessionRestoring) {
+            Toast.makeText(this, "当前库正在操作，请稍后重新导出", Toast.LENGTH_LONG).show(); return
+        }
+        batchBusy = true
+        work.execute {
+            var completed = 0
+            runCatching {
+                val directory = checkNotNull(DocumentFile.fromTreeUri(this, uri))
+                libraries.forEach { saved ->
+                    val name = saved.name.replace(Regex("[\\\\/:*?\"<>|]"), "_")
+                    val file = checkNotNull(directory.createFile("application/zip", "$name-${java.util.UUID.randomUUID().toString().take(8)}.magle-index.zip"))
+                    try { writeLibraryIndex(saved, file.uri); completed++ }
+                    catch (error: Exception) { file.delete(); throw error }
+                }
+                runOnUiThread { Toast.makeText(this, "已导出 $completed 个库的索引备份", Toast.LENGTH_LONG).show() }
+            }.onFailure { showError("已导出 $completed 个库，其余导出失败", it) }
+            runOnUiThread { batchBusy = false }
+        }
     }
 
     private fun exportIndex(saved: SavedLibrary, uri: Uri) {
@@ -2944,20 +2995,10 @@ class MainActivity : ComponentActivity() {
         }
         batchBusy = true
         work.execute {
-            val temporary = File(cacheDir, "index-export-${java.util.UUID.randomUUID()}.zip")
             runCatching {
-                val index = JSONObject(File(filesDir, "eagle-index-${saved.id.hashCode()}.json").readText())
-                val folders = JSONObject(File(filesDir, "eagle-folders-${saved.id.hashCode()}.json").readText())
-                temporary.outputStream().use { output ->
-                    writeIndexBackup(output, index, folders) { id, mtime ->
-                        File(File(cacheDir, "session-thumbnails"), LibraryLogic.thumbnailCacheKey(saved.id, id, mtime))
-                    }
-                }
-                contentResolver.openOutputStream(uri, "wt")!!.use { output -> temporary.inputStream().use { it.copyTo(output) } }
-                Log.i("MAGLE", "索引导出 ${saved.source.name}：${index.getJSONObject("items").length()} 项")
+                writeLibraryIndex(saved, uri)
                 runOnUiThread { Toast.makeText(this, "已导出 ${saved.name} 的索引备份", Toast.LENGTH_LONG).show() }
             }.onFailure { showError("导出索引失败，请重新导出", it) }
-            temporary.delete()
             runOnUiThread { batchBusy = false }
         }
     }
