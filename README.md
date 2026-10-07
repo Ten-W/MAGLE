@@ -1,8 +1,8 @@
 # MAGLE
 
-Android 端 Eagle 素材库查看与管理工具，当前版本 **0.8.58**。不是 Eagle 官方客户端。
+Android 端 Eagle 素材库查看与管理工具，当前版本 **0.8.61**。不是 Eagle 官方客户端。
 
-本版优化缩略图加载、滚动预加载与索引统计，精简设置中的关于区域，并提供手动检查软件更新。
+本版使用 R8 裁剪未使用的代码和资源，关闭调试，保留现有功能；暂不混淆名称。新增应用内更新下载与系统安装，并将索引备份入口整合到素材库卡片和添加菜单。
 
 ## 功能
 
@@ -17,12 +17,13 @@ Android 端 Eagle 素材库查看与管理工具，当前版本 **0.8.58**。不
 
 ## 使用
 
-1. 从 Releases 下载最新版测试 APK，在 Android 10 或更高版本上安装。
+1. 从 Releases 下载最新版 APK，在 Android 10 或更高版本上安装；已有安装请覆盖更新，不要先卸载。
 2. 打开设置，在“素材库”右侧点击加号，选择来源并授权或填写连接信息，选择 `.library` 库目录。
 3. 首次建立索引后，在视图页浏览、搜索和切换文件夹/标签；点击素材查看大图，详情按钮展开信息，长按开启多选。
 4. 上传按钮添加素材；设置中的手动更新或视图页下拉可检查库更新。
-5. 导出索引时选择单个库；在新设备先连接同库副本，再导入备份。备份不代替原文件备份。
+5. 在库卡片的编辑与删除之间点击导出索引备份；添加菜单底部可导入备份索引。在新设备先连接同库副本，再导入备份。备份不代替原文件备份。
 6. 设置底部显示版本号，可访问 GitHub 或手动检查软件更新；不会在启动时自动检查软件版本。
+7. 检查到新版后点击立即更新，后台下载完成后点击安装更新。首次须允许安装未知应用，并由系统确认安装。暂停的任务由系统重试，永久失败需重新下载；安装成功后下次启动清理安装包。
 
 ## 构建
 
@@ -33,10 +34,15 @@ sdk.dir=C:/Android/Sdk
 ```
 
 ```powershell
-./gradlew.bat :app:testDebugUnitTest :app:assembleDebug :app:lintDebug
+./gradlew.bat :app:testReleaseUnitTest :app:assembleRelease :app:lintRelease
+./gradlew.bat :app:assembleDebug
 ```
 
 Linux/macOS 可使用 `bash gradlew`。构建产物放在系统临时目录 `magle-github-build/app/outputs/apk/debug/`，避免同步服务锁定生成文件。
+
+优化版 APK 位于同目录下的 `outputs/apk/release/`。当前 GitHub 兼容发布继续使用此前的本机开发签名，使旧版本能覆盖更新；应用关闭调试，但不宣称已迁移到独立生产签名或具备商店发行资格。签名私钥不在仓库中，自行构建会使用自己的签名，不能覆盖官方 APK。不要通过卸载解决签名不匹配，否则会丢失应用数据。
+
+原生只读冒烟测试可用 `:app:assembleReleaseAndroidTest` 构建，在测试设备安装优化 APK 和测试 APK 后，运行 `adb shell am instrument -w com.tai.oeviewer.test/com.tai.oeviewer.ReleaseSmokeInstrumentation`；测试 APK 不作为发行文件。
 
 ## 网盘授权
 

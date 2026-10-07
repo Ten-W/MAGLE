@@ -408,6 +408,10 @@ class MainActivity : ComponentActivity() {
     private var savedLibraries by mutableStateOf<List<SavedLibrary>>(emptyList())
     private var settingsRefresh: Job? = null
     private var appUpdateChecking by mutableStateOf(false)
+    private val appDownload by lazy { AppDownload(this) }
+    private var appDownloadState by mutableStateOf(AppDownloadState())
+    private var appDownloadJob: Job? = null
+    private var appInstallBusy by mutableStateOf(false)
     private var appUpdateStatus by mutableStateOf("")
     private var appRelease by mutableStateOf<AppRelease?>(null)
     private var appReleaseDialogOpen by mutableStateOf(false)
@@ -491,6 +495,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        appRelease = appDownload.savedRelease()
         val viewerPrefs = getSharedPreferences("viewer", MODE_PRIVATE)
         viewMode = runCatching { AssetViewMode.valueOf(viewerPrefs.getString("mode", "WATERFALL")!!) }.getOrDefault(AssetViewMode.WATERFALL)
         gridCellSize = LibraryLogic.resizeCell(viewerPrefs.getFloat("gridSize", 112f), 1f, 32f, 2048f)
@@ -514,8 +519,25 @@ class MainActivity : ComponentActivity() {
         receiveSharedImages(intent)
     }
 
-    override fun onStart() { super.onStart(); foreground = true }
-    override fun onStop() { saveViewerPreferences(); foreground = false; super.onStop() }
+    override fun onStart() {
+        super.onStart(); foreground = true
+        appDownloadJob = lifecycleScope.launch {
+            while (true) {
+                try {
+                    if (appRelease != null) {
+                        val state = withContext(Dispatchers.IO) { appDownload.state() }
+                        appDownloadState = state
+                        if (state.message.isNotBlank()) appUpdateStatus = state.message
+                    }
+                } catch (error: Exception) {
+                    if (error is CancellationException) throw error
+                    appUpdateStatus = "无法读取下载状态，请稍后重试"
+                }
+                delay(1000)
+            }
+        }
+    }
+    override fun onStop() { appDownloadJob?.cancel(); saveViewerPreferences(); foreground = false; super.onStop() }
 
     private fun saveViewerPreferences() {
         getSharedPreferences("viewer", MODE_PRIVATE).edit().putString("mode", viewMode.name)
@@ -2566,19 +2588,17 @@ class MainActivity : ComponentActivity() {
                         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(16.dp)) {
                             Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                                 SettingsLibraries()
-                                SettingsCache()
+                                SettingsIndexUpdate()
                             }
                             Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                                SettingsIndexUpdate()
-                                SettingsIndexBackup()
+                                SettingsCache()
                                 SettingsAbout()
                             }
                         }
                     } else {
                         SettingsLibraries()
-                        SettingsCache()
                         SettingsIndexUpdate()
-                        SettingsIndexBackup()
+                        SettingsCache()
                         SettingsAbout()
                     }
                 }
@@ -2603,15 +2623,19 @@ class MainActivity : ComponentActivity() {
                         if (appUpdateChecking || appUpdateStatus.isNotBlank()) Text(if (appUpdateChecking) "正在检查…" else appUpdateStatus,
                             maxLines = 2, overflow = TextOverflow.Ellipsis)
                     },
-                    trailingContent = { TextButton(onClick = { checkAppUpdate() }, enabled = !appUpdateChecking) { Text("检查更新") } })
+                    trailingContent = { TextButton(onClick = {
+                        if (appRelease != null) downloadOrInstallUpdate() else checkAppUpdate()
+                    }, enabled = !appUpdateChecking && !appDownloadState.busy && !appInstallBusy) {
+                        Text(if (appInstallBusy) "校验中…" else if (appRelease != null) appDownloadState.button else "检查更新")
+                    } })
             }
         }
         if (appReleaseDialogOpen) appRelease?.let { release ->
             AlertDialog(onDismissRequest = { appReleaseDialogOpen = false },
                 title = { Text("发现新版本 ${release.version}") },
-                text = { Text(release.notes.ifBlank { "前往 GitHub 查看并下载 APK，安装由系统确认。" },
+                text = { Text(release.notes.ifBlank { "在应用内后台下载 APK，安装由系统确认。" },
                     Modifier.heightIn(max = 360.dp).verticalScroll(rememberScrollState())) },
-                confirmButton = { TextButton(onClick = { appReleaseDialogOpen = false; openProjectPage(release.page) }) { Text("前往下载") } },
+                confirmButton = { TextButton(onClick = { appReleaseDialogOpen = false; downloadOrInstallUpdate() }) { Text("立即更新") } },
                 dismissButton = { TextButton(onClick = { appReleaseDialogOpen = false }) { Text("稍后") } })
         }
     }
@@ -2619,6 +2643,37 @@ class MainActivity : ComponentActivity() {
     private fun openProjectPage(url: String) {
         runCatching { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url))) }
             .onFailure { Toast.makeText(this, "无法打开浏览器", Toast.LENGTH_SHORT).show() }
+    }
+
+    private fun downloadOrInstallUpdate() {
+        val release = appRelease ?: return
+        if (appInstallBusy || appDownloadState.busy) return
+        appInstallBusy = true
+        lifecycleScope.launch {
+            try {
+                val ready = withContext(Dispatchers.IO) {
+                    val completed = appDownload.savedRelease()?.version == release.version && appDownload.state().button == "安装更新"
+                    if (completed) {
+                        try { appDownload.validate(release) } catch (error: Exception) {
+                            appDownload.clear(); throw error
+                        }
+                    } else appDownload.start(release)
+                    completed
+                }
+                if (ready) {
+                    if (!packageManager.canRequestPackageInstalls()) Toast.makeText(this@MainActivity,
+                        "请允许 MAGLE 安装应用，返回后再点安装更新", Toast.LENGTH_LONG).show()
+                    appDownload.install(release)
+                }
+                appDownloadState = withContext(Dispatchers.IO) { appDownload.state() }
+                appUpdateStatus = appDownloadState.message
+            } catch (error: Exception) {
+                if (error is CancellationException) throw error
+                appUpdateStatus = error.message ?: "更新失败，请重试"
+                appDownloadState = withContext(Dispatchers.IO) { appDownload.state() }
+                Toast.makeText(this@MainActivity, appUpdateStatus, Toast.LENGTH_LONG).show()
+            } finally { appInstallBusy = false }
+        }
     }
 
     private fun checkAppUpdate() {
@@ -2693,7 +2748,7 @@ class MainActivity : ComponentActivity() {
                         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerHigh)
                     ) {
                         Box(Modifier.fillMaxWidth().padding(18.dp)) {
-                            Column(Modifier.fillMaxWidth().padding(end = 76.dp)) {
+                            Column(Modifier.fillMaxWidth().padding(end = 112.dp)) {
                                 Text(saved.name, style = MaterialTheme.typography.titleMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
                                 Text(
                                     "${saved.source.label} 库" +
@@ -2739,6 +2794,11 @@ class MainActivity : ComponentActivity() {
                             Row(Modifier.align(Alignment.BottomEnd)) {
                                 IconButton(onClick = { editLibraryCandidate = saved }, modifier = Modifier.size(36.dp)) {
                                     Icon(Icons.Default.Edit, contentDescription = "修改素材库", modifier = Modifier.size(19.dp))
+                                }
+                                IconButton(onClick = { exportIndexLibrary = saved; exportIndexChooser = true },
+                                    enabled = !indexing && !batchBusy && !remoteConnecting && !sessionRestoring &&
+                                        savedIndexes.any { it.libraryId == saved.id }, modifier = Modifier.size(36.dp)) {
+                                    Icon(painterResource(R.drawable.ic_download_24), contentDescription = "导出索引备份", modifier = Modifier.size(19.dp))
                                 }
                                 IconButton(onClick = { removeLibraryCandidate = saved }, enabled = !indexing && !batchBusy, modifier = Modifier.size(36.dp)) {
                                     Icon(Icons.Default.Delete, contentDescription = "移除素材库", modifier = Modifier.size(19.dp))
@@ -2823,7 +2883,7 @@ class MainActivity : ComponentActivity() {
     private fun SettingsIndexUpdate() {
                     Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
                     Box(Modifier.height(48.dp), contentAlignment = Alignment.CenterStart) {
-                        Text("索引更新", style = MaterialTheme.typography.titleMedium)
+                        Text("同步", style = MaterialTheme.typography.titleMedium)
                     }
                     Card(Modifier.fillMaxWidth(), shape = RoundedCornerShape(24.dp),
                         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerHigh)) {
@@ -2850,7 +2910,7 @@ class MainActivity : ComponentActivity() {
                             HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
                             ListItem(
                                 colors = ListItemDefaults.colors(containerColor = androidx.compose.ui.graphics.Color.Transparent),
-                                headlineContent = { Text("手动更新") },
+                                headlineContent = { Text("更新当前库索引") },
                                 supportingContent = { Text("完整检查当前库目录，包括未记录在变更清单中的素材；也可在视图界面下拉检查更新") },
                                 trailingContent = {
                                     TextButton(onClick = { updateCurrentIndex(fullScan = true) },
@@ -2865,49 +2925,11 @@ class MainActivity : ComponentActivity() {
     }
 
     @Composable
-    private fun SettingsIndexBackup() {
-        val available = !indexing && !batchBusy && !remoteConnecting && !sessionRestoring
-        Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            Box(Modifier.height(48.dp), contentAlignment = Alignment.CenterStart) {
-                Text("索引备份", style = MaterialTheme.typography.titleMedium)
-            }
-            Card(Modifier.fillMaxWidth(), shape = RoundedCornerShape(24.dp),
-                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerHigh)) {
-                ListItem(colors = ListItemDefaults.colors(containerColor = androidx.compose.ui.graphics.Color.Transparent),
-                    headlineContent = { Text("导出索引") },
-                    supportingContent = { Text("选择一个库，备份索引、目录、标签和已缓存缩略图；不含原文件与登录凭据") },
-                    trailingContent = { TextButton(enabled = available && savedLibraries.isNotEmpty(),
-                        onClick = { exportIndexChooser = true }) { Text("导出") } })
-                HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
-                ListItem(colors = ListItemDefaults.colors(containerColor = androidx.compose.ui.graphics.Color.Transparent),
-                    headlineContent = { Text("导入索引") },
-                    supportingContent = { Text("选择备份文件，再连接它对应的同一个库，核对后恢复") },
-                    trailingContent = { TextButton(enabled = available,
-                        onClick = { importIndexPicker.launch(arrayOf("application/zip", "application/octet-stream")) }) { Text("导入") } })
-            }
-        }
-    }
-
-    @Composable
     private fun ExportIndexDialog() {
-        var selected by remember { mutableStateOf<String?>(null) }
-        AlertDialog(onDismissRequest = { exportIndexChooser = false }, title = { Text("选择要导出的素材库") },
-            text = { Column(Modifier.heightIn(max = 400.dp).verticalScroll(rememberScrollState())) {
-                Text("每次仅导出一个库。包含已建立的索引及已有缩略图；未完成的索引不会自动补下载。")
-                savedLibraries.forEach { saved ->
-                    val exists = File(filesDir, "eagle-index-${saved.id.hashCode()}.json").isFile
-                    Row(Modifier.fillMaxWidth().clickable(enabled = exists) { selected = saved.id }.padding(vertical = 8.dp),
-                        verticalAlignment = Alignment.CenterVertically) {
-                        RadioButton(selected == saved.id, onClick = { selected = saved.id }, enabled = exists)
-                        Column(Modifier.padding(start = 8.dp)) {
-                            Text(saved.name)
-                            Text("${saved.source.label}${if (!exists) " · 尚无索引" else ""}", style = MaterialTheme.typography.bodySmall)
-                        }
-                    }
-                }
-            } },
-            confirmButton = { TextButton(enabled = selected != null, onClick = {
-                val saved = savedLibraries.firstOrNull { it.id == selected } ?: return@TextButton
+        val saved = exportIndexLibrary ?: return
+        AlertDialog(onDismissRequest = { exportIndexChooser = false }, title = { Text("导出索引备份 · ${saved.name}") },
+            text = { Text("备份这个库的索引、目录、标签及已有缩略图，不含原文件与登录凭据。未完成的索引不会自动补下载。") },
+            confirmButton = { TextButton(onClick = {
                 exportIndexChooser = false
                 exportIndexLibrary = saved
                 exportIndexPicker.launch("${saved.name.replace(Regex("[\\\\/:*?\"<>|]"), "_")}.magle-index.zip")
@@ -3031,6 +3053,10 @@ class MainActivity : ComponentActivity() {
                         },
                         modifier = Modifier.fillMaxWidth()
                     ) { Text("Microsoft OneDrive") }
+                    listOf(LibrarySource.DROPBOX, LibrarySource.GOOGLE).forEach { kind ->
+                        FilledTonalButton(onClick = { sourceChooserOpen = false; remoteChooser = kind },
+                            modifier = Modifier.fillMaxWidth()) { Text(kind.label) }
+                    }
                     FilledTonalButton(
                         onClick = {
                             sourceChooserOpen = false
@@ -3042,12 +3068,20 @@ class MainActivity : ComponentActivity() {
                         onClick = { sourceChooserOpen = false; webDavDialogOpen = true },
                         modifier = Modifier.fillMaxWidth()
                     ) { Text("WebDAV") }
-                    listOf(LibrarySource.DROPBOX, LibrarySource.GOOGLE, LibrarySource.SMB, LibrarySource.S3)
+                    listOf(LibrarySource.SMB, LibrarySource.S3)
                         .filter { newSourceForLibrary == null || it != LibrarySource.S3 }.forEach { kind ->
                         FilledTonalButton(
                             onClick = { sourceChooserOpen = false; remoteChooser = kind },
                             modifier = Modifier.fillMaxWidth()
                         ) { Text(if (kind == LibrarySource.S3) "S3（Beta）" else kind.label) }
+                    }
+                    if (newSourceForLibrary == null) {
+                        HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+                        FilledTonalButton(onClick = {
+                            sourceChooserOpen = false
+                            importIndexPicker.launch(arrayOf("application/zip", "application/octet-stream"))
+                        }, enabled = !indexing && !batchBusy && !remoteConnecting && !sessionRestoring,
+                            modifier = Modifier.fillMaxWidth()) { Text("导入备份索引") }
                     }
                 }
             },

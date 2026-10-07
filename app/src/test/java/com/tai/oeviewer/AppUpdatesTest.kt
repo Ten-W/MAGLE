@@ -20,7 +20,8 @@ class AppUpdatesTest {
     @Test fun onlyNewerDownloadableVersionsFromExpectedRepository() {
         fun release(tag: String, apk: Boolean = true) = JSONObject().put("tag_name", tag)
             .put("html_url", "$APP_REPOSITORY/releases/tag/$tag")
-            .put("assets", if (apk) JSONArray().put(JSONObject().put("name", "MAGLE.apk")) else JSONArray())
+            .put("assets", if (apk) JSONArray().put(JSONObject().put("name", "MAGLE.apk")
+                .put("browser_download_url", "$APP_REPOSITORY/releases/download/$tag/MAGLE.apk").put("size", 123)) else JSONArray())
         val entries = JSONArray().put(release("v0.8.9")).put(release("v0.8.57"))
             .put(release("v0.8.60").put("draft", true)).put(release("v1.0.0", false))
             .put(release("v9.0.0").put("html_url", "https://evil.example/app"))
@@ -29,5 +30,11 @@ class AppUpdatesTest {
         assertNull(newerAppRelease(entries, "0.8.58"))
         assertNull(versionParts("v999999999999.1.0"))
         assertNull(newerAppRelease(JSONArray(), "0.8.57"))
+        val unsafe = release("v0.8.59")
+        unsafe.getJSONArray("assets").getJSONObject(0).put("browser_download_url", "https://evil.example/app.apk")
+        assertNull(newerAppRelease(JSONArray().put(unsafe), "0.8.58"))
+        val corrupted = release("v0.8.59")
+        corrupted.getJSONArray("assets").getJSONObject(0).put("digest", "sha256:invalid")
+        assertNull(newerAppRelease(JSONArray().put(corrupted), "0.8.58"))
     }
 }

@@ -14,8 +14,9 @@ android {
         applicationId = "com.tai.oeviewer"
         minSdk = 29
         targetSdk = 36
-        versionCode = 82
-        versionName = "0.8.58"
+        versionCode = 85
+        versionName = "0.8.61"
+        testInstrumentationRunner = "com.tai.oeviewer.ReleaseSmokeInstrumentation"
         // MAGLE's public client registration; existing OE Link tokens remain isolated.
         val oneDriveId = providers.gradleProperty("magleOneDriveClientId")
             .orElse("7d995065-a18c-4b0d-9b3a-0917e773dc62").get()
@@ -25,10 +26,14 @@ android {
 
     buildTypes {
         release {
-            isMinifyEnabled = false
-            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"))
+            isMinifyEnabled = true
+            isShrinkResources = true
+            // Compatibility release for existing GitHub installs; never publish signing keys.
+            signingConfig = signingConfigs.getByName("debug")
+            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
         }
     }
+    testBuildType = "release"
 
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
