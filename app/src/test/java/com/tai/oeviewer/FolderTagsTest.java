@@ -8,6 +8,12 @@ import java.util.Set;
 import static org.junit.Assert.*;
 
 public class FolderTagsTest {
+    @Test public void folderCountsUnionDescendantsWithoutCountingSameAssetTwice() {
+        java.util.Map<String, Set<String>> items = java.util.Map.of("parent", Set.of("A", "B"), "child", Set.of("B", "C"));
+        assertEquals(3, LibraryLogic.folderAssetCount(items, List.of("parent", "child", "missing")));
+        assertEquals(2, LibraryLogic.folderAssetCount(items, List.of("child")));
+        assertEquals(0, LibraryLogic.folderAssetCount(items, List.of()));
+    }
     @Test public void renamesGroupWithoutChangingIdColorOrMembership() throws Exception {
         assertEquals("UI/Web", LibraryLogic.validTagName(" UI/Web "));
         try { LibraryLogic.validTagName("\n\t"); fail(); }

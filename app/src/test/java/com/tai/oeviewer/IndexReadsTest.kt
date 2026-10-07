@@ -8,6 +8,21 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
 class IndexReadsTest {
+    @Test(timeout = 3000) fun limitsInFlightReadsWithoutDroppingAnyResults() {
+        val workers = Executors.newFixedThreadPool(8)
+        val running = java.util.concurrent.atomic.AtomicInteger()
+        val peak = java.util.concurrent.atomic.AtomicInteger()
+        val accepted = mutableListOf<String>()
+        try {
+            assertTrue(readIndexChunk(workers, (0..7).map { "$it" }, { false }, {
+                val active = running.incrementAndGet()
+                peak.updateAndGet { old -> maxOf(old, active) }
+                try { Thread.sleep(15); it } finally { running.decrementAndGet() }
+            }, parallelism = 2) { id, result -> assertEquals(id, result.getOrThrow()); accepted += id })
+            assertEquals(8, accepted.distinct().size)
+            assertTrue(peak.get() <= 2)
+        } finally { workers.shutdownNow() }
+    }
     @Test(timeout = 3000) fun editingYieldsBlockedReadsAndCompletedItemsRemainAvailable() {
         val workers = Executors.newFixedThreadPool(2)
         val control = Executors.newSingleThreadExecutor()

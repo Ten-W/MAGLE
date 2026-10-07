@@ -12,6 +12,14 @@ final class LibraryLogic {
     static boolean authorizationRequired(int httpStatus) {
         return httpStatus == 400 || httpStatus == 401 || httpStatus == 403;
     }
+    static int folderAssetCount(java.util.Map<String, ? extends Set<String>> assetsByFolder, Collection<String> folderIds) {
+        Set<String> ids = new java.util.HashSet<>();
+        for (String folderId : folderIds) {
+            Set<String> assets = assetsByFolder.get(folderId);
+            if (assets != null) ids.addAll(assets);
+        }
+        return ids.size();
+    }
     static Integer positiveSetting(String input) {
         if (input == null || !input.matches("[0-9]+")) return null;
         try {
@@ -36,9 +44,9 @@ final class LibraryLogic {
         if (maxBytes < 0) throw new IllegalArgumentException("Negative cache limit");
         java.io.File[] files = directory.listFiles(file -> file.isFile() && file.getName().endsWith(".thumb"));
         if (files == null) return;
-        // ponytail: bounded private cache scan; add an eviction journal only if measured IO becomes costly.
-        java.util.Arrays.sort(files, java.util.Comparator.comparingLong(java.io.File::lastModified));
         long total = java.util.Arrays.stream(files).mapToLong(java.io.File::length).sum();
+        if (total <= maxBytes) return;
+        java.util.Arrays.sort(files, java.util.Comparator.comparingLong(java.io.File::lastModified));
         for (java.io.File file : files) {
             if (total <= maxBytes) break;
             long size = file.length();
@@ -272,6 +280,21 @@ final class LibraryLogic {
             if (first - offset >= 0) result.add(first - offset);
         }
         return result;
+    }
+
+    static int thumbnailEdge(int width, int height, int cellWidth, boolean naturalRatio) {
+        if (width <= 0 || height <= 0) return 600;
+        double ratio = naturalRatio ? Math.max(.55, Math.min(1.8, (double) width / height)) : 1;
+        double scale = Math.max((double) cellWidth / width, cellWidth / ratio / height);
+        // Bucket sizes so small layout changes reuse decoded images; cover both axes for Crop.
+        return (int) Math.min(Integer.MAX_VALUE, Math.ceil(Math.max(1, Math.max(width, height) * scale) / 128) * 128);
+    }
+
+    static int bitmapSampleSize(int width, int height, int edge) {
+        if (edge <= 0) throw new IllegalArgumentException("Invalid bitmap target");
+        int sample = 1;
+        while (Math.max(width, height) / (sample * 2L) >= edge) sample *= 2;
+        return sample;
     }
 
     static boolean isSharedImage(String scheme, String mimeType) {

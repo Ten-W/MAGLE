@@ -29,6 +29,7 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
+import androidx.lifecycle.lifecycleScope
 import androidx.documentfile.provider.DocumentFile
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.Canvas
@@ -63,7 +64,6 @@ import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
@@ -106,8 +106,6 @@ import androidx.compose.animation.expandIn
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.shrinkOut
-import androidx.compose.animation.slideInHorizontally
-import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.animation.core.MutableTransitionState
 import androidx.compose.animation.core.tween
 import androidx.compose.material.icons.Icons
@@ -128,7 +126,6 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CircularProgressIndicator
-import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ElevatedCard
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -140,8 +137,6 @@ import androidx.compose.material3.IconButtonDefaults
 import androidx.compose.material3.ListItem
 import androidx.compose.material3.ListItemDefaults
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.ModalBottomSheet
-import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.RadioButton
@@ -273,6 +268,7 @@ class MainActivity : ComponentActivity() {
 
     private val work: ExecutorService = Executors.newSingleThreadExecutor()
     private val indexWorkers: ExecutorService = Executors.newFixedThreadPool(8)
+    @Volatile private var galleryScrolling = false
     @Volatile private var pauseIndexForEdit = false
     private var tagRenameStatus by mutableStateOf("")
     private var attemptedTagResume = false
@@ -303,6 +299,9 @@ class MainActivity : ComponentActivity() {
     private val pickerStack = ArrayDeque<CloudFolder>()
     private val thumbnailCacheLock = Any()
     private val thumbnailRequests = Semaphore(4)
+    // ponytail: bounded striped locks coalesce same-file requests; unrelated collisions may briefly wait.
+    private val thumbnailLocks = Array(64) { kotlinx.coroutines.sync.Mutex() }
+    private var thumbnailMaintenance: kotlinx.coroutines.Job? = null
     private val bitmapCache = object : LruCache<String, Bitmap>(48 * 1024 * 1024) {
         override fun sizeOf(key: String, value: Bitmap) = value.allocationByteCount
     }
@@ -407,6 +406,33 @@ class MainActivity : ComponentActivity() {
     private var thumbnailCacheLimitEnabled by mutableStateOf(true)
     private var savedIndexes by mutableStateOf<List<LibraryIndexInfo>>(emptyList())
     private var savedLibraries by mutableStateOf<List<SavedLibrary>>(emptyList())
+    private var settingsRefresh: Job? = null
+    private var appUpdateChecking by mutableStateOf(false)
+    private var appUpdateStatus by mutableStateOf("")
+    private var appRelease by mutableStateOf<AppRelease?>(null)
+    private var appReleaseDialogOpen by mutableStateOf(false)
+    private val flatFolderTree by derivedStateOf { allFolders(folderTree) }
+    private data class BrowseStatistics(val sections: Map<LibrarySection, Int>, val tags: Map<String, Int>, val folders: Map<String, Set<String>>)
+    private val browseStatistics by derivedStateOf {
+        val tags = mutableMapOf<String, Int>()
+        val folders = mutableMapOf<String, MutableSet<String>>()
+        var active = 0; var unfiled = 0; var untagged = 0; var deleted = 0
+        for (asset in indexedAssets) {
+            if (asset.isDeleted) { deleted++; continue }
+            active++
+            if (asset.folders.isEmpty()) unfiled++
+            if (asset.tags.isEmpty()) untagged++
+            asset.tags.distinct().forEach { tags[it] = (tags[it] ?: 0) + 1 }
+            asset.folders.forEach { folders.getOrPut(it) { mutableSetOf() }.add(asset.id) }
+        }
+        BrowseStatistics(mapOf(LibrarySection.ALL to active, LibrarySection.UNFILED to unfiled,
+            LibrarySection.UNTAGGED to untagged, LibrarySection.TRASH to deleted), tags, folders)
+    }
+    private val cachedTagGroups by derivedStateOf {
+        val assigned = tagGroups.flatMap { group -> group.getJSONArray("tags").let { array -> (0 until array.length()).map { array.getString(it) } } }.toSet()
+        val ungrouped = browseStatistics.tags.keys.sorted().filterNot { it in assigned }
+        tagGroups + if (ungrouped.isEmpty()) emptyList() else listOf(JSONObject().put("id", "magle:ungrouped").put("name", "未分组").put("tags", JSONArray(ungrouped)))
+    }
 
     private var devicePrompt by mutableStateOf<DevicePrompt?>(null)
     private var pickerOpen by mutableStateOf(false)
@@ -641,7 +667,7 @@ class MainActivity : ComponentActivity() {
         if (renameTagOpen) NameDialog(if (selectedTags.isNotEmpty()) "重命名标签" else "重命名标签组",
             selectedTags.singleOrNull() ?: tagGroups.firstOrNull { it.getString("id") in selectedTagGroupIds }?.getString("name").orEmpty(),
             { renameTagOpen = false }) { name -> renameTagOpen = false; renameTagSelection(name) }
-        if (renameFolderOpen) NameDialog("重命名文件夹", allFolders(folderTree).firstOrNull { it.id in selectedFolderIds }?.name.orEmpty(),
+        if (renameFolderOpen) NameDialog("重命名文件夹", flatFolderTree.firstOrNull { it.id in selectedFolderIds }?.name.orEmpty(),
             { renameFolderOpen = false }) { name -> renameFolderOpen = false; changeFolders(name = name) }
         if (moveFoldersOpen) FolderPicker(emptySet(), false, { moveFoldersOpen = false }, rootLabel = "库根目录") { target ->
             moveFoldersOpen = false; changeFolders(parentId = target.firstOrNull())
@@ -698,7 +724,7 @@ class MainActivity : ComponentActivity() {
     private fun ViewerScreen(savedViews: SaveableStateHolder) {
         val folder = remember(folderTree, selectedFolderId, selectedSection) {
             if (selectedSection == LibrarySection.FOLDER && selectedFolderId == null) FolderNode("magle:root", "文件夹", folderTree)
-            else allFolders(folderTree).firstOrNull { it.id == selectedFolderId }
+            else flatFolderTree.firstOrNull { it.id == selectedFolderId }
         }
         val includedIds = remember(folder, selectedFolderId, includeSubfolderAssets) {
             if (includeSubfolderAssets && folder != null) allFolders(listOf(folder)).map { it.id }.toSet() else setOfNotNull(selectedFolderId)
@@ -715,7 +741,7 @@ class MainActivity : ComponentActivity() {
             }
         } }
         val query = searchQuery.trim()
-        val searchFolders = remember(folderTree, query) { allFolders(folderTree).filter { query.isNotBlank() && it.name.contains(query, true) } }
+        val searchFolders = remember(folderTree, query) { flatFolderTree.filter { query.isNotBlank() && it.name.contains(query, true) } }
         val searchTags = remember(indexedAssets, tagGroups, query) { availableTagGroups().flatMap { group ->
             val tags = group.getJSONArray("tags")
             (0 until tags.length()).map { tags.getString(it) }
@@ -785,11 +811,7 @@ class MainActivity : ComponentActivity() {
     @Composable
     private fun ViewerTopBar(assetCount: Int) {
         val groups = remember(tagGroups, indexedAssets) { availableTagGroups() }
-        val counts = remember(indexedAssets) {
-            val active = indexedAssets.filterNot { it.isDeleted }
-            mapOf(LibrarySection.ALL to active.size, LibrarySection.UNFILED to active.count { it.folders.isEmpty() },
-                LibrarySection.UNTAGGED to active.count { it.tags.isEmpty() }, LibrarySection.TRASH to indexedAssets.count { it.isDeleted })
-        }
+        val counts = browseStatistics.sections
         val keyboard = LocalSoftwareKeyboardController.current
         LaunchedEffect(searchOpen) { if (!searchOpen) keyboard?.hide() }
         Box {
@@ -1110,9 +1132,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun availableTagGroups(): List<JSONObject> {
-        val assigned = tagGroups.flatMap { group -> group.getJSONArray("tags").let { array -> (0 until array.length()).map { array.getString(it) } } }.toSet()
-        val ungrouped = indexedAssets.filterNot { it.isDeleted }.flatMap { it.tags }.distinct().sorted().filterNot { it in assigned }
-        return tagGroups + if (ungrouped.isEmpty()) emptyList() else listOf(JSONObject().put("id", "magle:ungrouped").put("name", "未分组").put("tags", JSONArray(ungrouped)))
+        return cachedTagGroups
     }
 
     @Composable
@@ -1130,7 +1150,7 @@ class MainActivity : ComponentActivity() {
         val tags = if (root) colors.keys.toList() else group?.getJSONArray("tags")?.let { values -> (0 until values.length()).map { values.getString(it) } }.orEmpty()
         val sections = remember(tags, query) { LibraryLogic.tagSections(tags.filter { it.contains(query, true) }) }
         val shownGroups = groups.filter { it.getString("name").contains(query, true) }
-        val counts = remember(indexedAssets) { indexedAssets.filterNot { it.isDeleted }.flatMap { it.tags.distinct() }.groupingBy { it }.eachCount() }
+        val counts = browseStatistics.tags
         val columns = LibraryLogic.folderColumnCount(with(LocalDensity.current) { LocalWindowInfo.current.containerSize.width.toDp().value }, folderScale)
         val iconSize by animateDpAsState((38.4f * folderScale).dp, tween(140), label = "tag-icon-size")
         LazyColumn(modifier.fillMaxSize().navigationBarsPadding(), contentPadding = androidx.compose.foundation.layout.PaddingValues(start = 12.dp, top = WindowInsets.statusBars.asPaddingValues().calculateTopPadding() + 68.dp, end = 12.dp, bottom = 104.dp)) {
@@ -1398,10 +1418,10 @@ class MainActivity : ComponentActivity() {
     private fun ChildFolders(folder: FolderNode) {
         var open by rememberSaveable(folder.id) { mutableStateOf(true) }
         val columns = LibraryLogic.folderColumnCount(with(LocalDensity.current) { LocalWindowInfo.current.containerSize.width.toDp().value }, folderScale)
-        val counts = remember(folder, indexedAssets) {
+        val counts = remember(folder, browseStatistics.folders) {
             folder.children.associate { child ->
                 val ids = allFolders(listOf(child)).map { it.id }.toSet()
-                child.id to indexedAssets.count { !it.isDeleted && LibraryLogic.belongsToAnyFolder(it.folders, ids) }
+                child.id to LibraryLogic.folderAssetCount(browseStatistics.folders, ids)
             }
         }
         Card(Modifier.fillMaxWidth().assetPinchZoom(viewMode, folderArea = true), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer)) {
@@ -1590,10 +1610,12 @@ class MainActivity : ComponentActivity() {
                 }
             } else if (mode == AssetViewMode.GRID) {
                 val state = rememberLazyGridState()
-                ThumbnailPrefetch(assets, 600) { state.layoutInfo.visibleItemsInfo.map { it.index - headerCount }.filter { it >= 0 } }
+                val columns = LibraryLogic.columnCount(maxWidth.value, gridCellSize)
+                val cellWidth = with(LocalDensity.current) { ((maxWidth - 24.dp - 8.dp * (columns - 1)) / columns).roundToPx() }.coerceAtLeast(1)
+                ThumbnailPrefetch(assets, cellWidth, scrolling = { state.isScrollInProgress }) { state.layoutInfo.visibleItemsInfo.map { it.index - headerCount }.filter { it >= 0 } }
                 LazyVerticalGrid(
                     state = state,
-                    columns = GridCells.Fixed(LibraryLogic.columnCount(maxWidth.value, gridCellSize)),
+                    columns = GridCells.Fixed(columns),
                     modifier = Modifier.fillMaxSize().selectionDrag(assets, mode,
                         hitTest = { p -> state.layoutInfo.visibleItemsInfo.firstOrNull { Rect(it.offset.x.toFloat(), it.offset.y.toFloat(), (it.offset.x + it.size.width).toFloat(), (it.offset.y + it.size.height).toFloat()).contains(p - Offset(contentLeftPx, state.layoutInfo.beforeContentPadding.toFloat())) }?.index?.minus(headerCount) },
                         scroll = { state.scrollBy(it) }).assetPinchZoom(mode),
@@ -1602,11 +1624,12 @@ class MainActivity : ComponentActivity() {
                     verticalArrangement = Arrangement.spacedBy(12.dp)
                 ) {
                     if (headerCount > 0) item(key = "browse-header", span = { GridItemSpan(maxLineSpan) }) { header() }
-                    items(assets, key = { it.id }) { asset -> AssetTile(asset, selectionList = assets, modifier = Modifier.animateItem()) }
+                    items(assets, key = { it.id }, contentType = { "asset" }) { asset -> AssetTile(asset, selectionList = assets, modifier = Modifier.animateItem(), cellWidth = cellWidth) }
                 }
             } else if (mode == AssetViewMode.LIST) {
                 val state = rememberLazyListState()
-                ThumbnailPrefetch(assets, 300) { state.layoutInfo.visibleItemsInfo.map { it.index - headerCount }.filter { it >= 0 } }
+                val cellWidth = with(LocalDensity.current) { listRowHeight.dp.roundToPx() }
+                ThumbnailPrefetch(assets, cellWidth, scrolling = { state.isScrollInProgress }) { state.layoutInfo.visibleItemsInfo.map { it.index - headerCount }.filter { it >= 0 } }
                 LazyColumn(
                     state = state,
                     modifier = Modifier.fillMaxSize().selectionDrag(assets, mode,
@@ -1616,14 +1639,16 @@ class MainActivity : ComponentActivity() {
                     verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
                     if (headerCount > 0) item(key = "browse-header") { header() }
-                    items(assets, key = { it.id }) { asset -> AssetListItem(asset, assets, animatedListHeight, Modifier.animateItem()) }
+                    items(assets, key = { it.id }, contentType = { "asset" }) { asset -> AssetListItem(asset, assets, animatedListHeight, Modifier.animateItem(), cellWidth) }
                 }
             } else {
                 val state = rememberLazyStaggeredGridState()
-                ThumbnailPrefetch(assets, 600) { state.layoutInfo.visibleItemsInfo.map { it.index - headerCount }.filter { it >= 0 } }
+                val columns = LibraryLogic.columnCount(maxWidth.value, waterfallCellSize)
+                val cellWidth = with(LocalDensity.current) { ((maxWidth - 24.dp - 8.dp * (columns - 1)) / columns).roundToPx() }.coerceAtLeast(1)
+                ThumbnailPrefetch(assets, cellWidth, true, scrolling = { state.isScrollInProgress }) { state.layoutInfo.visibleItemsInfo.map { it.index - headerCount }.filter { it >= 0 } }
                 LazyVerticalStaggeredGrid(
                     state = state,
-                    columns = StaggeredGridCells.Fixed(LibraryLogic.columnCount(maxWidth.value, waterfallCellSize)),
+                    columns = StaggeredGridCells.Fixed(columns),
                     modifier = Modifier.fillMaxSize().selectionDrag(assets, mode,
                         hitTest = { p -> state.layoutInfo.visibleItemsInfo.firstOrNull { Rect(it.offset.x.toFloat(), it.offset.y.toFloat(), (it.offset.x + it.size.width).toFloat(), (it.offset.y + it.size.height).toFloat()).contains(p - Offset(contentLeftPx, state.layoutInfo.beforeContentPadding.toFloat())) }?.index?.minus(headerCount) },
                         scroll = { state.scrollBy(it) }).assetPinchZoom(mode),
@@ -1632,7 +1657,7 @@ class MainActivity : ComponentActivity() {
                     verticalItemSpacing = 8.dp
                 ) {
                     if (headerCount > 0) item(key = "browse-header", span = StaggeredGridItemSpan.FullLine) { header() }
-                    items(assets, key = { it.id }) { asset -> AssetTile(asset, true, assets, Modifier.animateItem()) }
+                    items(assets, key = { it.id }, contentType = { "asset" }) { asset -> AssetTile(asset, true, assets, Modifier.animateItem(), cellWidth) }
                 }
             }
         }
@@ -1785,9 +1810,9 @@ class MainActivity : ComponentActivity() {
     }
 
     @Composable
-    private fun AssetTile(asset: AssetMeta, naturalRatio: Boolean = false, selectionList: List<AssetMeta>, modifier: Modifier = Modifier) {
+    private fun AssetTile(asset: AssetMeta, naturalRatio: Boolean = false, selectionList: List<AssetMeta>, modifier: Modifier = Modifier, cellWidth: Int) {
         var retryEpoch by remember(asset.id) { mutableIntStateOf(0) }
-        val preview = assetThumbnail(asset, 600, retryEpoch)
+        val preview = assetThumbnail(asset, LibraryLogic.thumbnailEdge(asset.width, asset.height, cellWidth, naturalRatio), retryEpoch)
         val bitmap = preview.bitmap
         ElevatedCard(
             modifier = modifier.assetInteraction(asset, selectionList)
@@ -1818,9 +1843,9 @@ class MainActivity : ComponentActivity() {
     }
 
     @Composable
-    private fun AssetListItem(asset: AssetMeta, selectionList: List<AssetMeta>, rowHeight: androidx.compose.ui.unit.Dp, modifier: Modifier) {
+    private fun AssetListItem(asset: AssetMeta, selectionList: List<AssetMeta>, rowHeight: androidx.compose.ui.unit.Dp, modifier: Modifier, cellWidth: Int) {
         var retryEpoch by remember(asset.id) { mutableIntStateOf(0) }
-        val preview = assetThumbnail(asset, 300, retryEpoch)
+        val preview = assetThumbnail(asset, LibraryLogic.thumbnailEdge(asset.width, asset.height, cellWidth, false), retryEpoch)
         val bitmap = preview.bitmap
         ElevatedCard(
             modifier = modifier.fillMaxWidth().assetInteraction(asset, selectionList)
@@ -1887,7 +1912,7 @@ class MainActivity : ComponentActivity() {
             val target = pages[pager.settledPage]
             if (target.id != infoAsset?.id) openAssetDetails(indexedAssets.firstOrNull { it.id == target.id } ?: target)
         }
-        val folderNames = remember(folderTree, asset.folders) { allFolders(folderTree)
+        val folderNames = remember(folderTree, asset.folders) { flatFolderTree
             .filter { it.id in asset.folders }
             .map { it.name } }
         val preview: @Composable (Modifier) -> Unit = { modifier ->
@@ -2194,7 +2219,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun downloadFolders() {
-        val ids = allFolders(folderTree).filter { it.id in selectedFolderIds }.flatMap { allFolders(listOf(it)) }.map { it.id }.toSet()
+        val ids = flatFolderTree.filter { it.id in selectedFolderIds }.flatMap { allFolders(listOf(it)) }.map { it.id }.toSet()
         val assets = indexedAssets.filter { !it.isDeleted && LibraryLogic.belongsToAnyFolder(it.folders, ids) }
         if (assets.isEmpty()) Toast.makeText(this, "选中的文件夹没有素材", Toast.LENGTH_SHORT).show()
         else runBatch(assets, "下载")
@@ -2367,28 +2392,38 @@ class MainActivity : ComponentActivity() {
     private suspend fun thumbnailBitmap(asset: AssetMeta, edge: Int): Bitmap {
         val key = bitmapKey(asset, edge)
         bitmapCache.get(key)?.let { return it }
-        return thumbnailRequests.withPermit {
-            withContext(Dispatchers.IO) {
-                bitmapCache.get(key) ?: (decodeSampled(loadThumbnail(asset), edge)
-                    ?: throw java.io.IOException("缩略图解码失败")).also { bitmapCache.put(key, it) }
+        val lock = thumbnailLocks[(thumbnailCacheFile(asset).name.hashCode() and Int.MAX_VALUE) % thumbnailLocks.size]
+        lock.lock()
+        try {
+            return thumbnailRequests.withPermit {
+                withContext(Dispatchers.IO) {
+                    bitmapCache.get(key) ?: (decodeSampled(loadThumbnail(asset), edge, coverTarget = true)
+                        ?: throw java.io.IOException("缩略图解码失败")).also { it.prepareToDraw(); bitmapCache.put(key, it) }
+                }
             }
-        }
+        } finally { lock.unlock() }
     }
 
     @Composable
-    private fun ThumbnailPrefetch(assets: List<AssetMeta>, edge: Int, visible: () -> List<Int>) {
-        LaunchedEffect(assets, edge, libraryId, connected, thumbnailCacheEpoch) {
+    private fun ThumbnailPrefetch(assets: List<AssetMeta>, cellWidth: Int, naturalRatio: Boolean = false, scrolling: () -> Boolean, visible: () -> List<Int>) {
+        LaunchedEffect(assets, cellWidth, naturalRatio, libraryId, connected, thumbnailCacheEpoch) {
+            try {
             if (source == LibrarySource.ONEDRIVE && !connected) return@LaunchedEffect
-            snapshotFlow { visible().let { (it.minOrNull() ?: -1) to (it.maxOrNull() ?: -1) } }
-                .distinctUntilChanged().collectLatest { (first, last) ->
+            snapshotFlow { visible().let { Triple(it.minOrNull() ?: -1, it.maxOrNull() ?: -1, scrolling()) to (settingsOpen || infoAsset != null) } }
+                .distinctUntilChanged().collectLatest { (range, blocked) ->
+                    val (first, last, moving) = range
+                    galleryScrolling = moving
+                    if (moving || blocked) return@collectLatest
                     delay(180)
                     // ponytail: one nearby prefetch at a time; visible requests retain three of four slots.
                     for (index in LibraryLogic.prefetchIndices(assets.size, first, last)) {
-                        try { thumbnailBitmap(assets[index], edge) } catch (error: Exception) {
+                        val asset = assets[index]
+                        try { thumbnailBitmap(asset, LibraryLogic.thumbnailEdge(asset.width, asset.height, cellWidth, naturalRatio)) } catch (error: Exception) {
                             if (error is CancellationException || error is InterruptedException) throw error
                         }
                     }
                 }
+            } finally { galleryScrolling = false }
         }
     }
 
@@ -2536,6 +2571,7 @@ class MainActivity : ComponentActivity() {
                             Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                                 SettingsIndexUpdate()
                                 SettingsIndexBackup()
+                                SettingsAbout()
                             }
                         }
                     } else {
@@ -2543,15 +2579,86 @@ class MainActivity : ComponentActivity() {
                         SettingsCache()
                         SettingsIndexUpdate()
                         SettingsIndexBackup()
+                        SettingsAbout()
                     }
-                    Text(
-                        "MAGLE · Android · v${packageManager.getPackageInfo(packageName, 0).versionName}",
-                        style = MaterialTheme.typography.labelMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier.padding(8.dp)
-                    )
                 }
             }
+        }
+    }
+
+    @Composable
+    private fun SettingsAbout() {
+        Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            Box(Modifier.height(48.dp), contentAlignment = Alignment.CenterStart) {
+                Text("关于", style = MaterialTheme.typography.titleMedium)
+            }
+            Card(Modifier.fillMaxWidth(), shape = RoundedCornerShape(24.dp),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerHigh)) {
+                val colors = ListItemDefaults.colors(containerColor = androidx.compose.ui.graphics.Color.Transparent)
+                ListItem(colors = colors, headlineContent = { Text("MAGLE · v${BuildConfig.VERSION_NAME}") },
+                    trailingContent = { TextButton(onClick = { openProjectPage(APP_REPOSITORY) }) { Text("GitHub") } })
+                HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+                ListItem(colors = colors, headlineContent = { Text("软件更新") },
+                    supportingContent = {
+                        if (appUpdateChecking || appUpdateStatus.isNotBlank()) Text(if (appUpdateChecking) "正在检查…" else appUpdateStatus,
+                            maxLines = 2, overflow = TextOverflow.Ellipsis)
+                    },
+                    trailingContent = { TextButton(onClick = { checkAppUpdate() }, enabled = !appUpdateChecking) { Text("检查更新") } })
+            }
+        }
+        if (appReleaseDialogOpen) appRelease?.let { release ->
+            AlertDialog(onDismissRequest = { appReleaseDialogOpen = false },
+                title = { Text("发现新版本 ${release.version}") },
+                text = { Text(release.notes.ifBlank { "前往 GitHub 查看并下载 APK，安装由系统确认。" },
+                    Modifier.heightIn(max = 360.dp).verticalScroll(rememberScrollState())) },
+                confirmButton = { TextButton(onClick = { appReleaseDialogOpen = false; openProjectPage(release.page) }) { Text("前往下载") } },
+                dismissButton = { TextButton(onClick = { appReleaseDialogOpen = false }) { Text("稍后") } })
+        }
+    }
+
+    private fun openProjectPage(url: String) {
+        runCatching { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url))) }
+            .onFailure { Toast.makeText(this, "无法打开浏览器", Toast.LENGTH_SHORT).show() }
+    }
+
+    private fun checkAppUpdate() {
+        if (appUpdateChecking) return
+        appUpdateChecking = true
+        lifecycleScope.launch {
+            try {
+                val release = withContext(Dispatchers.IO) {
+                    val request = (URL(APP_RELEASES_API).openConnection() as HttpURLConnection).apply {
+                        connectTimeout = 10_000; readTimeout = 10_000
+                        setRequestProperty("Accept", "application/vnd.github+json")
+                        setRequestProperty("User-Agent", "MAGLE/${BuildConfig.VERSION_NAME}")
+                    }
+                    try {
+                        val code = request.responseCode
+                        if (code == 404) throw java.io.IOException("无法读取更新：仓库可能为私有或发布信息不可访问，可前往 GitHub 查看")
+                        if (code != 200) throw java.io.IOException("检查失败：HTTP $code，请稍后重试")
+                        val bytes = request.inputStream.use { input ->
+                            val output = java.io.ByteArrayOutputStream()
+                            val buffer = ByteArray(8192)
+                            while (true) {
+                                val count = input.read(buffer)
+                                if (count < 0) break
+                                check(output.size() + count <= 1024 * 1024) { "更新信息过大" }
+                                output.write(buffer, 0, count)
+                            }
+                            output.toByteArray()
+                        }
+                        newerAppRelease(JSONArray(String(bytes, StandardCharsets.UTF_8)), BuildConfig.VERSION_NAME)
+                    } finally { request.disconnect() }
+                }
+                appRelease = release
+                appUpdateStatus = if (release == null) "当前已是最新版本" else "发现新版本 ${release.version}"
+                Toast.makeText(this@MainActivity, appUpdateStatus, Toast.LENGTH_SHORT).show()
+                if (release != null) appReleaseDialogOpen = true
+            } catch (error: Exception) {
+                if (error is CancellationException) throw error
+                appUpdateStatus = error.message ?: "检查更新失败，请检查网络"
+                Toast.makeText(this@MainActivity, appUpdateStatus, Toast.LENGTH_LONG).show()
+            } finally { appUpdateChecking = false }
         }
     }
 
@@ -2881,7 +2988,7 @@ class MainActivity : ComponentActivity() {
                     OutlinedButton(onClick = {
                         editLibraryCandidate = null
                         rebindLibraryCandidate = saved
-                    }) { Text("切换来源（保留索引）") }
+                    }) { Text("切换来源（保留索引） · Beta") }
                 }
             },
             confirmButton = {
@@ -3607,7 +3714,7 @@ class MainActivity : ComponentActivity() {
             // Bound outstanding reads so an edit can yield the index without queuing thousands of requests.
             for ((chunkIndex, chunk) in missing.chunked(8).withIndex()) {
                 val complete = readIndexChunk(indexWorkers, chunk, { pauseIndexForEdit },
-                    { id -> retry(3) { fetchAssetMetadata(id, mtimes[id] ?: 0L) } }) { id, result ->
+                    { id -> retry(3) { fetchAssetMetadata(id, mtimes[id] ?: 0L) } }, parallelism = if (galleryScrolling) 4 else 8) { id, result ->
                     result.onSuccess { asset ->
                         if (asset == null) ignored[id] = mtimes[id] ?: 0L else cached[id] = asset
                     }.onFailure {
@@ -3803,7 +3910,7 @@ class MainActivity : ComponentActivity() {
             if (!cached.exists() && !(clearCacheOnExit && isFinishing)) {
                 cached.parentFile?.mkdirs()
                 cached.writeBytes(bytes)
-                trimThumbnailCache()
+                scheduleThumbnailMaintenance()
             }
         }
         return bytes
@@ -3861,39 +3968,63 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun trimThumbnailCache() = synchronized(thumbnailCacheLock) {
+        val epoch = thumbnailCacheEpoch
         val directory = File(cacheDir, "session-thumbnails")
         if (thumbnailCacheLimitEnabled) LibraryLogic.trimThumbnailCache(directory, thumbnailCacheLimitMb.toLong() * 1024 * 1024)
         val files = directory.listFiles().orEmpty().filter { it.isFile && it.name.endsWith(".thumb") }
         val bytes = files.sumOf(File::length)
-        runOnUiThread { thumbnailCacheCount = files.size; thumbnailCacheBytes = bytes }
+        runOnUiThread { if (epoch == thumbnailCacheEpoch) { thumbnailCacheCount = files.size; thumbnailCacheBytes = bytes } }
+    }
+
+    private fun scheduleThumbnailMaintenance() = synchronized(thumbnailCacheLock) {
+        if (thumbnailMaintenance?.isActive != true) {
+            // ponytail: batch directory maintenance once per second; limit may briefly exceed by in-flight downloads.
+            thumbnailMaintenance = lifecycleScope.launch(Dispatchers.IO) {
+                delay(1000)
+                trimThumbnailCache()
+            }
+        }
     }
 
     private fun refreshSettings() {
-        pendingUploadCount = pendingUploads().size
-        val cacheFiles = File(cacheDir, "session-thumbnails").listFiles().orEmpty().filter(File::isFile)
-        thumbnailCacheCount = cacheFiles.size
-        thumbnailCacheBytes = cacheFiles.sumOf(File::length)
-        savedIndexes = filesDir.listFiles { file ->
-            file.name.startsWith("eagle-index-") && file.name.endsWith(".json")
-        }.orEmpty().mapNotNull { file ->
-            runCatching {
-                val root = JSONObject(file.readText())
-                val id = root.optString("libraryId")
-                LibraryIndexInfo(
-                    file = file,
-                    libraryId = id,
-                    name = root.optString("libraryName").ifBlank { "旧素材库索引" },
-                    itemCount = root.optJSONObject("items")?.length() ?: 0,
-                    scanTotal = root.optInt("scanTotal", root.optJSONObject("items")?.length() ?: 0),
-                    failedCount = root.optInt("failedCount"),
-                    bytes = file.length() + (File(
-                        filesDir,
-                        file.name.replaceFirst("eagle-index-", "eagle-folders-")
-                    ).takeIf(File::isFile)?.length() ?: 0L),
-                    current = id.isNotBlank() && id == libraryId
-                )
-            }.getOrNull()
-        }.sortedWith(compareByDescending<LibraryIndexInfo> { it.current }.thenBy { it.name })
+        settingsRefresh?.cancel()
+        val selectedLibrary = libraryId
+        val cacheEpoch = thumbnailCacheEpoch
+        settingsRefresh = lifecycleScope.launch {
+            delay(100) // Coalesce bursts of index/settings notifications before reading disk.
+            val (uploads, cacheSize, indexes) = withContext(Dispatchers.IO) {
+                val uploads = pendingUploads().size
+                val cacheFiles = File(cacheDir, "session-thumbnails").listFiles().orEmpty().filter(File::isFile)
+                val cacheSize = cacheFiles.size to cacheFiles.sumOf(File::length)
+                val indexes = filesDir.listFiles { file ->
+                    file.name.startsWith("eagle-index-") && file.name.endsWith(".json")
+                }.orEmpty().mapNotNull { file ->
+                    if (!isActive) throw CancellationException()
+                    runCatching {
+                        val root = JSONObject(file.readText())
+                        val id = root.optString("libraryId")
+                        LibraryIndexInfo(
+                            file = file,
+                            libraryId = id,
+                            name = root.optString("libraryName").ifBlank { "旧素材库索引" },
+                            itemCount = root.optJSONObject("items")?.length() ?: 0,
+                            scanTotal = root.optInt("scanTotal", root.optJSONObject("items")?.length() ?: 0),
+                            failedCount = root.optInt("failedCount"),
+                            bytes = file.length() + (File(filesDir,
+                                file.name.replaceFirst("eagle-index-", "eagle-folders-")
+                            ).takeIf(File::isFile)?.length() ?: 0L),
+                            current = id.isNotBlank() && id == selectedLibrary
+                        )
+                    }.getOrNull()
+                }.sortedWith(compareByDescending<LibraryIndexInfo> { it.current }.thenBy { it.name })
+                Triple(uploads, cacheSize, indexes)
+            }
+            pendingUploadCount = uploads
+            if (cacheEpoch == thumbnailCacheEpoch) {
+                thumbnailCacheCount = cacheSize.first; thumbnailCacheBytes = cacheSize.second
+            }
+            if (selectedLibrary == libraryId) savedIndexes = indexes
+        }
     }
 
     private fun clearThumbnailCache(showMessage: Boolean) {
@@ -4083,7 +4214,7 @@ class MainActivity : ComponentActivity() {
         var tags by remember { mutableStateOf(emptyList<String>()) }
         var folderMenu by remember { mutableStateOf(false) }
         var tagMenu by remember { mutableStateOf(false) }
-        val folderNames = allFolders(folderTree).filter { it.id in folderIds }.map { it.name }
+        val folderNames = flatFolderTree.filter { it.id in folderIds }.map { it.name }
         AlertDialog(
             onDismissRequest = { uploadCandidates = emptyList() },
             title = { Text("上传 ${uploadCandidates.size} 张图片") },
@@ -5092,11 +5223,12 @@ class MainActivity : ComponentActivity() {
 
 private fun enc(value: String) = Uri.encode(value)
 
-private fun decodeSampled(bytes: ByteArray, maxEdge: Int): Bitmap? {
+private fun decodeSampled(bytes: ByteArray, maxEdge: Int, coverTarget: Boolean = false): Bitmap? {
     val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
     BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
-    var sample = 1
-    while (maxOf(bounds.outWidth, bounds.outHeight) / sample > maxEdge) sample *= 2
+    var sample = LibraryLogic.bitmapSampleSize(bounds.outWidth, bounds.outHeight, maxEdge)
+    // Original-image viewing keeps its existing memory ceiling; only thumbnails must cover their cell.
+    if (!coverTarget && maxOf(bounds.outWidth, bounds.outHeight) / sample > maxEdge) sample *= 2
     return BitmapFactory.decodeByteArray(bytes, 0, bytes.size, BitmapFactory.Options().apply { inSampleSize = sample })
 }
 
