@@ -1,14 +1,14 @@
 [
   {
-    "tag_name": "v0.8.63",
-    "html_url": "https://github.com/Ten-W/MAGLE/releases/tag/v0.8.63",
-    "body": "统一素材库工具图标和间距，修复应用内更新下载并支持续传、公开更新信息后备和多库索引备份。精简正式安装包，沿用兼容签名。",
+    "tag_name": "v0.8.73",
+    "html_url": "https://github.com/Ten-W/MAGLE/releases/tag/v0.8.73",
+    "body": "精简正式版，约 7.1 MB。修正文件夹和标签层级返回、保留列表位置，优化界面切换和下拉刷新，多选仅保留边框。沿用兼容签名，请覆盖更新，不要卸载。",
     "assets": [
       {
-        "name": "MAGLE-v0.8.63-release.apk",
-        "browser_download_url": "https://github.com/Ten-W/MAGLE/releases/download/v0.8.63/MAGLE-v0.8.63-release.apk",
-        "size": 7412533,
-        "digest": "sha256:5123b05f352c47eeb6467de321c2ec6c4b29ad234662c2a8cd358be7f3da9548"
+        "name": "MAGLE-v0.8.73-release.apk",
+        "browser_download_url": "https://github.com/Ten-W/MAGLE/releases/download/v0.8.73/MAGLE-v0.8.73-release.apk",
+        "size": 7411985,
+        "digest": "sha256:199f642441164736261a00b3af097db5b214ffd2ab8a648219f0f82907526f1e"
       }
     ]
   }
