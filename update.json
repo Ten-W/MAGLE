@@ -1,0 +1,15 @@
+[
+  {
+    "tag_name": "v0.8.61",
+    "html_url": "https://github.com/Ten-W/MAGLE/releases/tag/v0.8.61",
+    "body": "精简正式安装包，保留升级兼容性。",
+    "assets": [
+      {
+        "name": "MAGLE-v0.8.61-release.apk",
+        "browser_download_url": "https://github.com/Ten-W/MAGLE/releases/download/v0.8.61/MAGLE-v0.8.61-release.apk",
+        "size": 7391350,
+        "digest": "sha256:fa47e78bee0a24e829f891ed4e203893bcc08486ebe74b17859564b9119f96df"
+      }
+    ]
+  }
+]
