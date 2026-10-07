@@ -178,6 +178,10 @@ final class LibraryLogic {
         return Float.isFinite(fraction) ? Math.max(0f, Math.min(2f, fraction)) * thresholdPx : 0f;
     }
 
+    static boolean refreshAfterRelease(boolean pending, boolean pressed) {
+        return pending && !pressed;
+    }
+
     static String refreshResultMessage(int remaining) {
         return remaining == 0 ? "刷新完成 · 索引已更新" : "刷新未完成 · 仍有 " + remaining + " 项待读取";
     }

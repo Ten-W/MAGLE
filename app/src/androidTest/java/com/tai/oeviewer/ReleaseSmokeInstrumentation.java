@@ -94,7 +94,7 @@ public class ReleaseSmokeInstrumentation extends Instrumentation {
                 finish(Activity.RESULT_OK, result); return;
             }
             require((context.getApplicationInfo().flags & ApplicationInfo.FLAG_DEBUGGABLE) == 0, "Expected non-debuggable package");
-            require("0.8.63".equals(context.getPackageManager().getPackageInfo(context.getPackageName(), 0).versionName), "Wrong version");
+            require("0.8.73".equals(context.getPackageManager().getPackageInfo(context.getPackageName(), 0).versionName), "Wrong version");
             if ("true".equals(arguments.getString("testAppDownload"))) {
                 startActivitySync(new Intent().setClassName(context.getPackageName(), context.getPackageName() + ".MainActivity").addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
                 waitForIdleSync();
@@ -181,8 +181,13 @@ public class ReleaseSmokeInstrumentation extends Instrumentation {
             require(bitmap.getWidth() == 64 && bitmap.getHeight() == 64, "SVG rendering failed");
             bitmap.recycle();
             Activity activity = startActivitySync(new Intent().setClassName(context.getPackageName(), context.getPackageName() + ".MainActivity").addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
-            waitForIdleSync();
+            if ("true".equals(arguments.getString("testFolderBack"))) Thread.sleep(1000); else waitForIdleSync();
             require(!activity.isFinishing(), "Activity failed to start");
+            if ("true".equals(arguments.getString("testFolderBack"))) {
+                testFolderBack(activity);
+                result.putString("result", "PASS: folder and tag hierarchy, root exit confirmation timeout");
+                finish(Activity.RESULT_OK, result); return;
+            }
             if ("true".equals(arguments.getString("testIndexExport"))) {
                 java.lang.reflect.Method current = activity.getClass().getDeclaredMethod("currentLibrary");
                 current.setAccessible(true);
@@ -212,5 +217,101 @@ public class ReleaseSmokeInstrumentation extends Instrumentation {
             result.putString("result", "FAIL: " + error.getClass().getSimpleName() + ": " + error.getMessage());
             finish(Activity.RESULT_CANCELED, result);
         }
+    }
+
+    private Object invoke(Object receiver, String name, Object... args) throws Exception {
+        for (java.lang.reflect.Method method : receiver.getClass().getDeclaredMethods()) {
+            if (method.getName().equals(name) && method.getParameterCount() == args.length) {
+                method.setAccessible(true); return method.invoke(receiver, args);
+            }
+        }
+        // Optimized getters can be inlined into direct field reads.
+        if (name.startsWith("get") && args.length == 0) {
+            String fieldName = Character.toLowerCase(name.charAt(3)) + name.substring(4);
+            java.lang.reflect.Field field = receiver.getClass().getDeclaredField(fieldName);
+            field.setAccessible(true); return field.get(receiver);
+        }
+        throw new NoSuchMethodException(name);
+    }
+
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    private void testFolderBack(Activity activity) throws Exception {
+        Object original = invoke(activity, "currentBrowse");
+        Class<?> section = activity.getClassLoader().loadClass("com.tai.oeviewer.LibrarySection");
+        Object folderSection = Enum.valueOf((Class) section, "FOLDER");
+        java.util.List<?> roots = (java.util.List<?>) invoke(activity, "getFolderTree");
+        Object parent = null, child = null;
+        for (Object node : roots) {
+            java.util.List<?> children = (java.util.List<?>) invoke(node, "getChildren");
+            if (!children.isEmpty()) { parent = node; child = children.get(0); break; }
+        }
+        require(child != null, "Need a real nested test folder");
+        String parentId = (String) invoke(parent, "getId"), childId = (String) invoke(child, "getId");
+        String parentName = (String) invoke(parent, "getName"), childName = (String) invoke(child, "getName");
+        try {
+            navigationStatus("navigate");
+            navigateTest(activity, folderSection, null, "文件夹");
+            navigateTest(activity, folderSection, parentId, parentName);
+            navigateTest(activity, folderSection, childId, childName);
+            runOnMainSync(activity::onBackPressed);
+            Thread.sleep(500);
+            require(parentId.equals(invoke(invoke(activity, "currentBrowse"), "getFolderId")), "Commit did not reach parent");
+            navigationStatus("root and exit confirmation");
+            runOnMainSync(activity::onBackPressed);
+            Thread.sleep(500);
+            Object root = invoke(activity, "currentBrowse");
+            require(invoke(root, "getFolderId") == null && folderSection.equals(invoke(root, "getSection")), "Skipped folder root");
+            navigationStatus("tag hierarchy");
+            java.util.List<JSONObject> groups = (java.util.List<JSONObject>) invoke(activity, "availableTagGroups");
+            JSONObject group = null;
+            for (JSONObject candidate : groups) if (candidate.getJSONArray("tags").length() > 0) { group = candidate; break; }
+            require(group != null, "Need a real tag group");
+            final String groupId = group.getString("id"), groupName = group.getString("name"), tagName = group.getJSONArray("tags").getString(0);
+            Object tagRoot = Enum.valueOf((Class) section, "TAGGROUPS"), tagGroup = Enum.valueOf((Class) section, "TAGGROUP"), tagSection = Enum.valueOf((Class) section, "TAG");
+            navigateTest(activity, tagRoot, null, "标签管理");
+            runOnMainSync(() -> { try { invoke(activity, "navigateBrowse", tagSection, null, tagName, tagName, null); }
+                catch (Exception error) { throw new RuntimeException(error); } });
+            Thread.sleep(500);
+            runOnMainSync(activity::onBackPressed); Thread.sleep(500);
+            require(tagRoot.equals(invoke(invoke(activity, "currentBrowse"), "getSection")), "Total-list tag invented a parent group");
+            runOnMainSync(() -> { try { invoke(activity, "navigateBrowse", tagGroup, null, groupId, groupName, null); }
+                catch (Exception error) { throw new RuntimeException(error); } });
+            Thread.sleep(500);
+            runOnMainSync(() -> { try { invoke(activity, "navigateBrowse", tagSection, null, tagName, tagName, groupId); }
+                catch (Exception error) { throw new RuntimeException(error); } });
+            Thread.sleep(500);
+            runOnMainSync(activity::onBackPressed); Thread.sleep(500);
+            Object returnedGroup = invoke(activity, "currentBrowse");
+            require(tagGroup.equals(invoke(returnedGroup, "getSection")) && groupId.equals(invoke(returnedGroup, "getTag")), "Tag skipped its group");
+            runOnMainSync(activity::onBackPressed); Thread.sleep(500);
+            require(tagRoot.equals(invoke(invoke(activity, "currentBrowse"), "getSection")), "Group skipped tag management");
+            runOnMainSync(activity::onBackPressed);
+            Thread.sleep(500);
+            require(!activity.isFinishing(), "First root back exited");
+            Thread.sleep(2100);
+            runOnMainSync(activity::onBackPressed);
+            Thread.sleep(300);
+            require(!activity.isFinishing(), "Exit confirmation did not expire");
+            runOnMainSync(activity::onBackPressed);
+            Thread.sleep(600);
+            require(activity.isFinishing() || !activity.hasWindowFocus(), "Second root back did not return to desktop");
+        } finally {
+            runOnMainSync(() -> {
+                try { invoke(activity, "restoreBrowse", original); }
+                catch (Exception error) { throw new RuntimeException(error); }
+            });
+        }
+    }
+
+    private void navigationStatus(String step) {
+        Bundle status = new Bundle(); status.putString("navigation", step); sendStatus(20, status);
+    }
+
+    private void navigateTest(Activity activity, Object section, String id, String name) {
+        runOnMainSync(() -> {
+            try { invoke(activity, "navigateBrowse", section, id, null, name, null); }
+            catch (Exception error) { throw new RuntimeException(error); }
+        });
+        android.os.SystemClock.sleep(500);
     }
 }

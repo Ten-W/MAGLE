@@ -23,6 +23,8 @@ import android.util.LruCache
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
+import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.togetherWith
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.result.IntentSenderRequest
 import androidx.activity.compose.setContent
@@ -41,9 +43,8 @@ import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.material3.AssistChip
-import androidx.compose.material3.pulltorefresh.PullToRefreshBox
-import androidx.compose.material3.pulltorefresh.PullToRefreshDefaults
 import androidx.compose.material3.pulltorefresh.rememberPullToRefreshState
+import androidx.compose.material3.pulltorefresh.pullToRefresh
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FilledTonalIconButton
 import androidx.compose.foundation.border
@@ -101,8 +102,8 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.animation.core.animateDpAsState
-import androidx.compose.animation.core.animateFloat
-import androidx.compose.ui.draw.rotate
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.foundation.layout.requiredSize
 import androidx.compose.animation.animateContentSize
 import androidx.compose.animation.expandIn
 import androidx.compose.animation.fadeIn
@@ -120,6 +121,7 @@ import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.outlined.Share
 import androidx.compose.material.icons.outlined.Info
@@ -652,35 +654,50 @@ class MainActivity : ComponentActivity() {
                     Box(Modifier.fillMaxSize()) {
                         key(browseReset) {
                             val savedViews = rememberSaveableStateHolder()
-                            BackHandler(enabled = settingsOpen || searchOpen || searchQuery.isNotBlank() || viewPickerOpen || directoryMenuOpen || hasSelection() || selectedSection == LibrarySection.FOLDER || browseHistory.isNotEmpty()) {
+                            var exitArmed by remember { mutableStateOf(false) }
+                            LaunchedEffect(exitArmed) {
+                                if (exitArmed) delay(2_000)
+                                exitArmed = false
+                            }
+                            LaunchedEffect(browseKey, settingsOpen, foreground, infoAsset) { exitArmed = false }
+                            val transientOpen = settingsOpen || searchOpen || searchQuery.isNotBlank() || viewPickerOpen || directoryMenuOpen || hasSelection()
+                            LaunchedEffect(transientOpen) { if (transientOpen) exitArmed = false }
+                            val hasParent = (selectedSection == LibrarySection.FOLDER && selectedFolderId != null) ||
+                                selectedSection == LibrarySection.TAG || selectedSection == LibrarySection.TAGGROUP
+                            fun returnToParent(target: BrowseLocation) {
+                                savedViews.removeState(browseKey)
+                                browseHistory = browseHistory.filter { it.key != target.key }
+                                restoreBrowse(target)
+                            }
+                            BackHandler(enabled = infoAsset == null && (transientOpen || hasParent || !exitArmed)) {
                                 when {
                                     settingsOpen -> { settingsOpen = false; searchOpen = searchQuery.isNotBlank() }
                                     directoryMenuOpen -> directoryMenuOpen = false
                                     hasSelection() -> if (!batchBusy) clearSelection()
                                     viewPickerOpen -> viewPickerOpen = false
                                     searchOpen || searchQuery.isNotBlank() -> { searchOpen = false; searchQuery = "" }
-                                    selectedSection == LibrarySection.FOLDER || browseHistory.isNotEmpty() -> {
-                                        val positions = folderPositions(folderTree)
-                                        val parent = positions[selectedFolderId]?.second?.let { id ->
-                                            positions[id]?.let { id to it.first }
-                                        }
-                                        val previous = currentBrowse().backTarget(browseHistory, parent, nextBrowseKey++)
-                                            ?: return@BackHandler
-                                        savedViews.removeState(browseKey)
-                                        val previousIndex = browseHistory.indexOfLast { it.key == previous.key }
-                                        browseHistory = when {
-                                            previousIndex >= 0 -> browseHistory.take(previousIndex)
-                                            previous.section == LibrarySection.ALL -> emptyList()
-                                            else -> browseHistory
-                                        }
-                                        restoreBrowse(previous)
+                                    hasParent -> parentBrowse()?.let(::returnToParent)
+                                    else -> {
+                                        exitArmed = true
+                                        Toast.makeText(this@MainActivity, "再返回一次退出应用", Toast.LENGTH_SHORT).show()
                                     }
                                 }
                             }
                             HorizontalPager(state = appPager, beyondViewportPageCount = 1,
                                 userScrollEnabled = !batchBusy && !searchOpen && !directoryMenuOpen && infoAsset == null && !hasSelection(),
                                 modifier = Modifier.fillMaxSize()) { page ->
-                                if (page == 0) ViewerScreen(savedViews) else SettingsScreen()
+                                if (page == 0) {
+                                    Box(Modifier.fillMaxSize()) {
+                                        Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
+                                            AnimatedContent(targetState = currentBrowse(), contentKey = { it.key },
+                                                modifier = Modifier.fillMaxSize(), label = "browse-content",
+                                                transitionSpec = {
+                                                    // Compose's standard fade-through content transition.
+                                                    (fadeIn(tween(220, delayMillis = 90)) + androidx.compose.animation.scaleIn(tween(220, delayMillis = 90), initialScale = .92f)) togetherWith fadeOut(tween(90))
+                                                }) { location -> ViewerScreen(savedViews, location) }
+                                        }
+                                    }
+                                } else SettingsScreen()
                             }
                         }
                     }
@@ -751,7 +768,12 @@ class MainActivity : ComponentActivity() {
 
     @OptIn(ExperimentalMaterial3Api::class)
     @Composable
-    private fun ViewerScreen(savedViews: SaveableStateHolder) {
+    private fun ViewerScreen(savedViews: SaveableStateHolder, location: BrowseLocation = currentBrowse()) {
+        val selectedSection = location.section
+        val selectedFolderId = location.folderId
+        val selectedTag = location.tag
+        val includeSubfolderAssets = location.includeChildren
+        val searchQuery = location.query
         val folder = remember(folderTree, selectedFolderId, selectedSection) {
             if (selectedSection == LibrarySection.FOLDER && selectedFolderId == null) FolderNode("magle:root", "文件夹", folderTree)
             else flatFolderTree.firstOrNull { it.id == selectedFolderId }
@@ -784,34 +806,51 @@ class MainActivity : ComponentActivity() {
         // Keep item order stable while a gesture is selecting, even if indexing publishes a new batch.
         val visibleAssets = if (selectedAssetIds.isNotEmpty()) selectionAssets else filteredAssets
         val refreshState = rememberPullToRefreshState()
-        val refreshDistancePx = with(LocalDensity.current) { 80.dp.toPx() }
+        val refreshDistancePx = with(LocalDensity.current) { 48.dp.toPx() }
         var refreshRequested by remember { mutableStateOf(false) }
+        var refreshGesturePressed by remember { mutableStateOf(false) }
+        var refreshPending by remember { mutableStateOf(false) }
+        LaunchedEffect(refreshPending, refreshGesturePressed) {
+            if (LibraryLogic.refreshAfterRelease(refreshPending, refreshGesturePressed)) {
+                refreshPending = false
+                refreshRequested = updateCurrentIndex()
+                if (refreshRequested) pullRefreshFeedbackPending = true
+            }
+        }
         LaunchedEffect(indexing) { if (!indexing) refreshRequested = false }
 
         Box(Modifier.fillMaxSize()) {
                 when {
                     !libraryLoaded -> Welcome(Modifier.fillMaxSize())
-                    else -> savedViews.SaveableStateProvider(browseKey) { PullToRefreshBox(
-                        isRefreshing = refreshRequested && indexing,
-                        state = refreshState,
-                        onRefresh = {
-                            refreshRequested = updateCurrentIndex()
-                            if (refreshRequested) pullRefreshFeedbackPending = true
-                        },
-                        modifier = Modifier.fillMaxSize(),
-                        indicator = {} // Draw above the floating toolbar, starting at the screen's top edge.
+                    else -> savedViews.SaveableStateProvider(location.key) { Box(
+                        Modifier.fillMaxSize().pointerInput(refreshState) {
+                            awaitEachGesture {
+                                awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
+                                refreshGesturePressed = true
+                                try {
+                                    do {
+                                        val event = awaitPointerEvent(PointerEventPass.Initial)
+                                    } while (event.changes.any { it.pressed })
+                                } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                                    refreshPending = false
+                                    throw cancelled
+                                } finally {
+                                    refreshGesturePressed = false
+                                }
+                            }
+                        }.pullToRefresh(
+                            isRefreshing = refreshRequested && indexing, state = refreshState,
+                            threshold = 48.dp, onRefresh = { refreshPending = true })
                     ) {
                         val childFolder = folder?.takeIf { selectedSection == LibrarySection.FOLDER && it.children.isNotEmpty() }
-                        LibraryContent(visibleAssets, viewMode, Modifier.fillMaxSize().graphicsLayer {
+                        LibraryContent(visibleAssets, location.mode, Modifier.fillMaxSize().graphicsLayer {
                             translationY = LibraryLogic.refreshContentOffset(refreshState.distanceFraction, refreshDistancePx)
                         }, childFolder,
                             selectedSection == LibrarySection.TAGGROUPS || selectedSection == LibrarySection.TAGGROUP,
-                            query, searchTags, searchFolders)
+                            query, searchTags, searchFolders, location)
                     } }
                 }
-                ViewerTopBar(visibleAssets.size)
-                if (libraryLoaded) PullToRefreshDefaults.Indicator(state = refreshState,
-                    isRefreshing = refreshRequested && indexing, modifier = Modifier.align(Alignment.TopCenter))
+                ViewerTopBar(visibleAssets.size, location) { refreshState.distanceFraction }
             }
     }
 
@@ -839,7 +878,10 @@ class MainActivity : ComponentActivity() {
     }
 
     @Composable
-    private fun ViewerTopBar(assetCount: Int) {
+    private fun ViewerTopBar(assetCount: Int, location: BrowseLocation = currentBrowse(), pullFraction: () -> Float = { 0f }) {
+        val selectedSection = location.section
+        val selectedTag = location.tag
+        val selectedFolderName = location.name
         val groups = remember(tagGroups, indexedAssets) { availableTagGroups() }
         val counts = browseStatistics.sections
         val keyboard = LocalSoftwareKeyboardController.current
@@ -916,9 +958,7 @@ class MainActivity : ComponentActivity() {
                                 overflow = TextOverflow.Ellipsis,
                                 modifier = Modifier.weight(1f, fill = false)
                             )
-                            if (libraryLoaded && indexing) CircularProgressIndicator(
-                                Modifier.padding(start = 6.dp).size(12.dp), strokeWidth = 1.5.dp
-                            )
+                            if (libraryLoaded) DirectoryRefreshIndicator(pullFraction)
                         }
                         }
                         if (menuTransition.currentState || menuTransition.targetState) Popup(
@@ -1137,7 +1177,7 @@ class MainActivity : ComponentActivity() {
                         Text(tag, Modifier.padding(start = 8.dp), maxLines = 1, overflow = TextOverflow.Ellipsis)
                     }
                 }, trailingIcon = { Text((counts[tag] ?: 0).toString()) }, onClick = {
-                    navigateBrowse(LibrarySection.TAG, null, tag, tag)
+                    navigateBrowse(LibrarySection.TAG, null, tag, tag, parentGroupId = id)
                 })
             }
         }
@@ -1166,7 +1206,10 @@ class MainActivity : ComponentActivity() {
     }
 
     @Composable
-    private fun TagCollections(modifier: Modifier = Modifier) {
+    private fun TagCollections(modifier: Modifier = Modifier, location: BrowseLocation = currentBrowse()) {
+        val selectedTag = location.tag
+        val selectedSection = location.section
+        val searchQuery = location.query
         val groups = remember(tagGroups, indexedAssets) { availableTagGroups() }
         val group = groups.firstOrNull { it.getString("id") == selectedTag }
         val root = selectedSection == LibrarySection.TAGGROUPS
@@ -1411,12 +1454,40 @@ class MainActivity : ComponentActivity() {
     private fun currentBrowse() = BrowseLocation(browseKey, selectedSection, selectedFolderId, selectedTag,
         selectedFolderName, searchQuery, includeSubfolderAssets, viewMode)
 
-    private fun navigateBrowse(section: LibrarySection, folderId: String?, tag: String?, name: String) {
+    private fun parentBrowse(): BrowseLocation? {
+        val positions = folderPositions(folderTree)
+        val parent = if (selectedSection == LibrarySection.TAG) {
+            val groups = availableTagGroups().filter { group ->
+                val tags = group.getJSONArray("tags")
+                (0 until tags.length()).any { tags.getString(it) == selectedTag }
+            }
+            val saved = browseHistory.lastOrNull { it.section == LibrarySection.TAGGROUP && groups.any { group -> group.getString("id") == it.tag } }
+            groups.firstOrNull { it.getString("id") == saved?.tag }?.let { it.getString("id") to it.getString("name") }
+        } else positions[selectedFolderId]?.second?.let { id -> positions[id]?.let { id to it.first } }
+        return currentBrowse().backTarget(browseHistory, parent, nextBrowseKey++)
+    }
+
+    private fun navigateBrowse(section: LibrarySection, folderId: String?, tag: String?, name: String, parentGroupId: String? = null) {
         if (batchBusy) return
         val current = currentBrowse()
         val target = BrowseLocation(nextBrowseKey, section, folderId, tag, name, "", includeSubfolderAssets, viewMode)
         if (!current.sameDestination(target) || current.query.isNotBlank()) {
-            browseHistory = browseHistory + current
+            // Only retain ancestor scroll states, never a browser-like back stack.
+            val positions = folderPositions(folderTree)
+            val ancestors = generateSequence(folderId) { positions[it]?.second }.toSet()
+            browseHistory = if (section == LibrarySection.FOLDER) (browseHistory + current).filter {
+                it.section == LibrarySection.FOLDER && it.query.isBlank() &&
+                    (it.folderId == null || it.folderId in ancestors) && !it.sameDestination(target)
+            }.distinctBy { it.folderId } else if (section == LibrarySection.TAG || section == LibrarySection.TAGGROUP) {
+                val group = if (section == LibrarySection.TAG) availableTagGroups().filter { entry ->
+                    val tags = entry.getJSONArray("tags")
+                    (0 until tags.length()).any { tags.getString(it) == tag }
+                }.firstOrNull { it.getString("id") == current.tagParentId(parentGroupId) } else null
+                val states = (browseHistory + current).filter { it.query.isBlank() &&
+                    (it.section == LibrarySection.TAGGROUPS || (it.section == LibrarySection.TAGGROUP && it.tag == group?.getString("id"))) }
+                if (group != null && states.none { it.section == LibrarySection.TAGGROUP }) states + target.copy(
+                    key = ++nextBrowseKey, section = LibrarySection.TAGGROUP, tag = group.getString("id"), name = group.getString("name")) else states
+            } else emptyList()
             nextBrowseKey++
             restoreBrowse(target)
         } else searchQuery = ""
@@ -1616,9 +1687,10 @@ class MainActivity : ComponentActivity() {
         tagsPage: Boolean = false,
         query: String = "",
         searchTags: List<String> = emptyList(),
-        searchFolders: List<FolderNode> = emptyList()
+        searchFolders: List<FolderNode> = emptyList(),
+        location: BrowseLocation = currentBrowse()
     ) {
-        if (tagsPage && query.isBlank()) { TagCollections(modifier); return }
+        if (tagsPage && query.isBlank()) { TagCollections(modifier, location); return }
         val headerCount = if (childFolder == null && query.isBlank()) 0 else 1
         val contentTop = LibraryLogic.galleryTopPadding(WindowInsets.statusBars.asPaddingValues().calculateTopPadding().value).dp
         val contentLeftPx = with(LocalDensity.current) { 12.dp.toPx() }
@@ -1867,7 +1939,6 @@ class MainActivity : ComponentActivity() {
                         modifier = Modifier.fillMaxSize()
                     )
                 }
-                if (asset.id in selectedAssetIds) SelectionMark(Modifier.align(Alignment.TopEnd))
             }
         }
     }
@@ -1903,16 +1974,8 @@ class MainActivity : ComponentActivity() {
                     )
                 }
             }
-            if (asset.id in selectedAssetIds) SelectionMark(Modifier.align(Alignment.TopEnd))
             }
         }
-    }
-
-    @Composable
-    private fun SelectionMark(modifier: Modifier) {
-        Icon(Icons.Default.Check, contentDescription = "已选中",
-            tint = MaterialTheme.colorScheme.onPrimary,
-            modifier = modifier.padding(6.dp).background(MaterialTheme.colorScheme.primary, CircleShape).padding(3.dp).size(16.dp))
     }
 
     @OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
@@ -2705,6 +2768,30 @@ class MainActivity : ComponentActivity() {
     }
 
     @Composable
+    private fun DirectoryRefreshIndicator(pullFraction: () -> Float) {
+        val reveal by animateFloatAsState(
+            if (indexing) 1f else (pullFraction() * 2f).coerceIn(0f, 1f),
+            animationSpec = tween(80), label = "directory-refresh-reveal")
+        Box(Modifier.width(26.dp * reveal).height(20.dp)
+            .graphicsLayer { alpha = reveal }) {
+            IndexRefreshIcon(Modifier.requiredSize(20.dp).align(Alignment.CenterEnd).graphicsLayer {
+                scaleX = reveal; scaleY = reveal
+                if (!indexing) rotationZ = pullFraction().coerceIn(0f, 2f) * 180f
+            },
+                if (indexing) "正在更新索引" else "下拉更新索引")
+        }
+    }
+
+    @Composable
+    private fun IndexRefreshIcon(modifier: Modifier, description: String) {
+        if (indexing) Box(modifier, contentAlignment = Alignment.Center) {
+            CircularProgressIndicator(Modifier.fillMaxSize(2f / 3f).semantics { contentDescription = description },
+                color = androidx.compose.material3.LocalContentColor.current, strokeWidth = 1.35.dp)
+        }
+        else Icon(Icons.Default.Refresh, description, modifier)
+    }
+
+    @Composable
     private fun SettingsLibraries() {
         Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
                     Row(
@@ -2720,15 +2807,7 @@ class MainActivity : ComponentActivity() {
                         IconButton(onClick = { updateCurrentIndex(fullScan = true) }, modifier = Modifier.size(48.dp),
                             enabled = savedLibraries.isNotEmpty() && libraryLoaded && !indexing && !batchBusy && !remoteConnecting && !sessionRestoring &&
                                 (source != LibrarySource.ONEDRIVE || connected)) {
-                            val rotation = if (indexing) {
-                                val transition = androidx.compose.animation.core.rememberInfiniteTransition(label = "index-sync")
-                                val angle by transition.animateFloat(0f, 360f,
-                                    androidx.compose.animation.core.infiniteRepeatable(tween(1000, easing = androidx.compose.animation.core.LinearEasing)),
-                                    label = "index-sync-angle")
-                                angle
-                            } else 0f
-                            Icon(painterResource(R.drawable.ic_sync_24), contentDescription = "更新当前库索引",
-                                modifier = Modifier.size(22.dp).rotate(rotation))
+                            IndexRefreshIcon(Modifier.size(22.dp), "更新当前库索引")
                         }
                         IconButton(onClick = {
                             if (savedLibraries.size == 1) beginIndexExport(savedLibraries) else exportIndexChooser = true

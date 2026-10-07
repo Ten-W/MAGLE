@@ -4,6 +4,12 @@ import org.junit.Test;
 import static org.junit.Assert.*;
 
 public class ViewerZoomTest {
+    @Test public void refreshWaitsForFingerRelease() {
+        assertFalse(LibraryLogic.refreshAfterRelease(true, true));
+        assertTrue(LibraryLogic.refreshAfterRelease(true, false));
+        assertFalse(LibraryLogic.refreshAfterRelease(false, true));
+        assertFalse(LibraryLogic.refreshAfterRelease(false, false));
+    }
     @Test public void refreshFeedbackDoesNotCallPartialReadsSuccessful() {
         assertEquals("刷新完成 · 索引已更新", LibraryLogic.refreshResultMessage(0));
         assertEquals("刷新未完成 · 仍有 3 项待读取", LibraryLogic.refreshResultMessage(3));
