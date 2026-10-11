@@ -371,6 +371,7 @@ class MainActivity : ComponentActivity() {
     private var selectedTag by mutableStateOf<String?>(null)
     private var browseHistory by mutableStateOf<List<BrowseLocation>>(emptyList())
     private var browseKey by mutableLongStateOf(0L)
+    private var browseSearchReturnKey: Long? = null
     private var browseReset by mutableIntStateOf(0)
     private var nextBrowseKey = 1L
     private var indexing by mutableStateOf(false)
@@ -515,7 +516,7 @@ class MainActivity : ComponentActivity() {
         clearCacheOnExit = viewerPrefs.getBoolean("clearCacheOnExit", false)
         thumbnailCacheLimitMb = viewerPrefs.getInt("cacheLimitMb", 512).coerceAtLeast(1)
         thumbnailCacheLimitEnabled = viewerPrefs.getBoolean("cacheLimitEnabled", true)
-        work.execute { trimThumbnailCache() }
+        indexWorkers.execute { trimThumbnailCache() }
         enableEdgeToEdge()
         ensureWritePermissionMigration()
         loadSavedLibrary()
@@ -588,7 +589,8 @@ class MainActivity : ComponentActivity() {
 
     private fun updateCurrentIndex(fullScan: Boolean = false): Boolean {
         if (!libraryLoaded || indexing || batchBusy || remoteConnecting || hasSelection()) return false
-        if (source == LibrarySource.ONEDRIVE && !connected) return false
+        if (source == LibrarySource.ONEDRIVE && !LibraryLogic.canRefreshOneDrive(
+                connected, driveId != null, oneDriveRefreshToken() != null)) return false
         val id = libraryId ?: return false
         loadLibrary(id, libraryName.orEmpty(), false, fullScan)
         return true
@@ -1261,12 +1263,8 @@ class MainActivity : ComponentActivity() {
                         style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
                 items(values, key = { "tag:$it" }) { tag ->
-                    Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).tagInteraction(tag, false) { navigateBrowse(LibrarySection.TAG, null, tag, tag) }
-                        .padding(horizontal = 16.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                        Box(Modifier.size(6.dp).background(tagGroupColor(if (root) colors[tag].orEmpty() else group?.optString("color").orEmpty()), CircleShape))
-                        Text(tag, Modifier.weight(1f, fill = false), style = MaterialTheme.typography.bodyMedium, maxLines = 2, overflow = TextOverflow.Ellipsis)
-                        Text("· ${counts[tag] ?: 0}", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    TagRow(tag, if (root) colors[tag].orEmpty() else group?.optString("color").orEmpty(), counts[tag] ?: 0) {
+                        navigateBrowse(LibrarySection.TAG, null, tag, tag)
                     }
                 }
             }
@@ -1452,7 +1450,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun currentBrowse() = BrowseLocation(browseKey, selectedSection, selectedFolderId, selectedTag,
-        selectedFolderName, searchQuery, includeSubfolderAssets, viewMode)
+        selectedFolderName, searchQuery, includeSubfolderAssets, viewMode, browseSearchReturnKey)
 
     private fun parentBrowse(): BrowseLocation? {
         val positions = folderPositions(folderTree)
@@ -1467,14 +1465,16 @@ class MainActivity : ComponentActivity() {
         return currentBrowse().backTarget(browseHistory, parent, nextBrowseKey++)
     }
 
-    private fun navigateBrowse(section: LibrarySection, folderId: String?, tag: String?, name: String, parentGroupId: String? = null) {
+    private fun navigateBrowse(section: LibrarySection, folderId: String?, tag: String?, name: String, parentGroupId: String? = null, fromSearch: Boolean = false) {
         if (batchBusy) return
         val current = currentBrowse()
-        val target = BrowseLocation(nextBrowseKey, section, folderId, tag, name, "", includeSubfolderAssets, viewMode)
+        val target = BrowseLocation(nextBrowseKey, section, folderId, tag, name, "", includeSubfolderAssets, viewMode,
+            searchReturnKey = current.key.takeIf { fromSearch && current.query.isNotBlank() })
         if (!current.sameDestination(target) || current.query.isNotBlank()) {
-            // Only retain ancestor scroll states, never a browser-like back stack.
+            // Retain ancestor scroll states and the explicit search entry, not a browser-like back stack.
             val positions = folderPositions(folderTree)
             val ancestors = generateSequence(folderId) { positions[it]?.second }.toSet()
+            val previousStates = browseHistory + current
             browseHistory = if (section == LibrarySection.FOLDER) (browseHistory + current).filter {
                 it.section == LibrarySection.FOLDER && it.query.isBlank() &&
                     (it.folderId == null || it.folderId in ancestors) && !it.sameDestination(target)
@@ -1488,6 +1488,8 @@ class MainActivity : ComponentActivity() {
                 if (group != null && states.none { it.section == LibrarySection.TAGGROUP }) states + target.copy(
                     key = ++nextBrowseKey, section = LibrarySection.TAGGROUP, tag = group.getString("id"), name = group.getString("name")) else states
             } else emptyList()
+            val searchKeys = (browseHistory + target).mapNotNull { it.searchReturnKey }.toSet()
+            browseHistory = browseHistory + previousStates.filter { it.query.isNotBlank() && it.key in searchKeys }
             nextBrowseKey++
             restoreBrowse(target)
         } else searchQuery = ""
@@ -1498,6 +1500,7 @@ class MainActivity : ComponentActivity() {
 
     private fun restoreBrowse(location: BrowseLocation) {
         browseKey = location.key
+        browseSearchReturnKey = location.searchReturnKey
         selectedSection = location.section
         selectedFolderId = location.folderId
         selectedTag = location.tag
@@ -1511,6 +1514,7 @@ class MainActivity : ComponentActivity() {
 
     private fun resetBrowseHistory() {
         browseHistory = emptyList()
+        browseSearchReturnKey = null
         browseKey = nextBrowseKey++
         browseReset++
     }
@@ -1553,17 +1557,17 @@ class MainActivity : ComponentActivity() {
     }
 
     @Composable
-    private fun FolderCard(folder: FolderNode, count: Int, modifier: Modifier) {
+    private fun FolderCard(folder: FolderNode, count: Int, modifier: Modifier, onOpen: () -> Unit = { selectFolder(folder) }) {
         val iconSize by animateDpAsState((38.4f * folderScale).dp, tween(140), label = "folder-icon-size")
         val chosen = folder.id in selectedFolderIds
         Column(modifier.border(if (chosen) 1.5.dp else 0.dp, if (chosen) MaterialTheme.colorScheme.primary else androidx.compose.ui.graphics.Color.Transparent, RoundedCornerShape(8.dp))
             .combinedClickable(enabled = !batchBusy && selectedAssetIds.isEmpty() && selectedTags.isEmpty() && selectedTagGroupIds.isEmpty(), role = androidx.compose.ui.semantics.Role.Button,
-                onClick = { if (selectedFolderIds.isEmpty()) selectFolder(folder) else selectedFolderIds = if (chosen) selectedFolderIds - folder.id else selectedFolderIds + folder.id },
+                onClick = { if (selectedFolderIds.isEmpty()) onOpen() else selectedFolderIds = if (chosen) selectedFolderIds - folder.id else selectedFolderIds + folder.id },
                 onLongClick = { if (selectedAssetIds.isNotEmpty()) clearSelection(); selectedFolderIds = selectedFolderIds + folder.id; searchOpen = false; viewPickerOpen = false; directoryMenuOpen = false })
             .semantics { selected = chosen }.padding(vertical = 6.dp),
             horizontalAlignment = Alignment.CenterHorizontally) {
             Icon(painterResource(R.drawable.ic_folder_24), contentDescription = null,
-                tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(iconSize))
+                tint = tagGroupColor(folder.iconColor), modifier = Modifier.size(iconSize))
             Text("${folder.name} · $count", Modifier.fillMaxWidth(), textAlign = androidx.compose.ui.text.style.TextAlign.Center,
                 style = MaterialTheme.typography.labelSmall, maxLines = 2, overflow = TextOverflow.Ellipsis)
         }
@@ -1589,6 +1593,7 @@ class MainActivity : ComponentActivity() {
                     Icon(
                         painterResource(R.drawable.ic_folder_24),
                         contentDescription = null,
+                        tint = tagGroupColor(row.node.iconColor),
                         modifier = Modifier.size(22.dp)
                     )
                     Spacer(Modifier.width(10.dp))
@@ -1653,26 +1658,55 @@ class MainActivity : ComponentActivity() {
     }
 
     @Composable
+    private fun TagRow(tag: String, color: String, count: Int, onOpen: () -> Unit) {
+        Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).tagInteraction(tag, false, onOpen)
+            .padding(horizontal = 16.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            Box(Modifier.size(6.dp).background(tagGroupColor(color), CircleShape))
+            Text(tag, Modifier.weight(1f, fill = false), style = MaterialTheme.typography.bodyMedium, maxLines = 2, overflow = TextOverflow.Ellipsis)
+            Text("· $count", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+    }
+
+    @Composable
     private fun SearchSections(query: String, tags: List<String>, folders: List<FolderNode>) {
         var tagsOpen by rememberSaveable(query) { mutableStateOf(true) }
         var foldersOpen by rememberSaveable(query) { mutableStateOf(true) }
+        val colors = remember(cachedTagGroups) { buildMap {
+            availableTagGroups().forEach { group -> val values = group.getJSONArray("tags")
+                repeat(values.length()) { putIfAbsent(values.getString(it), group.optString("color")) }
+            }
+        } }
+        val columns = LibraryLogic.folderColumnCount(with(LocalDensity.current) { LocalWindowInfo.current.containerSize.width.toDp().value }, folderScale)
+        val counts = remember(folders, browseStatistics.folders) { folders.associate { folder ->
+            folder.id to LibraryLogic.folderAssetCount(browseStatistics.folders, allFolders(listOf(folder)).map { it.id }.toSet())
+        } }
         Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerHigh)) {
                 Row(Modifier.fillMaxWidth().clickable { tagsOpen = !tagsOpen }.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
                     Icon(if (tagsOpen) Icons.Default.KeyboardArrowDown else Icons.AutoMirrored.Filled.KeyboardArrowRight, "展开或收起标签")
                     Text("标签 · ${tags.size}", style = MaterialTheme.typography.labelLarge)
                 }
-                if (tagsOpen) FlowRow(Modifier.padding(horizontal = 12.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    tags.forEach { tag -> AssistChip(onClick = { navigateBrowse(LibrarySection.TAG, null, tag, tag) }, label = { Text(tag) }) }
+                if (tagsOpen) tags.forEach { tag ->
+                    TagRow(tag, colors[tag].orEmpty(), browseStatistics.tags[tag] ?: 0) {
+                        navigateBrowse(LibrarySection.TAG, null, tag, tag, fromSearch = true)
+                    }
                 }
             }
-            Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerHigh)) {
+            Card(Modifier.assetPinchZoom(viewMode, folderArea = true), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerHigh)) {
                 Row(Modifier.fillMaxWidth().clickable { foldersOpen = !foldersOpen }.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
                     Icon(if (foldersOpen) Icons.Default.KeyboardArrowDown else Icons.AutoMirrored.Filled.KeyboardArrowRight, "展开或收起文件夹")
                     Text("文件夹 · ${folders.size}", style = MaterialTheme.typography.labelLarge)
                 }
-                if (foldersOpen) folders.forEach { folder ->
-                    DropdownMenuItem(text = { Text(folder.name) }, leadingIcon = { Icon(painterResource(R.drawable.ic_folder_24), null) }, onClick = { selectFolder(folder) })
+                if (foldersOpen) folders.chunked(columns).forEach { row ->
+                    Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        row.forEach { folder ->
+                            key(folder.id) { FolderCard(folder, counts[folder.id] ?: 0, Modifier.weight(1f)) {
+                                navigateBrowse(LibrarySection.FOLDER, folder.id, null, folder.name, fromSearch = true)
+                            } }
+                        }
+                        repeat(columns - row.size) { Spacer(Modifier.weight(1f)) }
+                    }
                 }
             }
         }
@@ -1720,7 +1754,11 @@ class MainActivity : ComponentActivity() {
                     columns = GridCells.Fixed(columns),
                     modifier = Modifier.fillMaxSize().selectionDrag(assets, mode,
                         hitTest = { p -> state.layoutInfo.visibleItemsInfo.firstOrNull { Rect(it.offset.x.toFloat(), it.offset.y.toFloat(), (it.offset.x + it.size.width).toFloat(), (it.offset.y + it.size.height).toFloat()).contains(p - Offset(contentLeftPx, state.layoutInfo.beforeContentPadding.toFloat())) }?.index?.minus(headerCount) },
-                        scroll = { state.scrollBy(it) }).assetPinchZoom(mode),
+                        scroll = { state.scrollBy(it) }).assetPinchZoom(mode, skipAt = { p ->
+                            headerCount > 0 && state.layoutInfo.visibleItemsInfo.firstOrNull { it.index == 0 }?.let {
+                                LibraryLogic.isHeaderGesture(p.y, it.offset.y, it.size.height, state.layoutInfo.beforeContentPadding)
+                            } == true
+                        }),
                     contentPadding = androidx.compose.foundation.layout.PaddingValues(start = 12.dp, top = contentTop, end = 12.dp, bottom = 104.dp),
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                     verticalArrangement = Arrangement.spacedBy(12.dp)
@@ -1736,7 +1774,11 @@ class MainActivity : ComponentActivity() {
                     state = state,
                     modifier = Modifier.fillMaxSize().selectionDrag(assets, mode,
                         hitTest = { p -> val y = p.y - state.layoutInfo.beforeContentPadding; state.layoutInfo.visibleItemsInfo.firstOrNull { y >= it.offset && y < it.offset + it.size }?.index?.minus(headerCount) },
-                        scroll = { state.scrollBy(it) }).assetPinchZoom(mode),
+                        scroll = { state.scrollBy(it) }).assetPinchZoom(mode, skipAt = { p ->
+                            headerCount > 0 && state.layoutInfo.visibleItemsInfo.firstOrNull { it.index == 0 }?.let {
+                                LibraryLogic.isHeaderGesture(p.y, it.offset, it.size, state.layoutInfo.beforeContentPadding)
+                            } == true
+                        }),
                     contentPadding = androidx.compose.foundation.layout.PaddingValues(start = 12.dp, top = contentTop, end = 12.dp, bottom = 104.dp),
                     verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
@@ -1753,7 +1795,11 @@ class MainActivity : ComponentActivity() {
                     columns = StaggeredGridCells.Fixed(columns),
                     modifier = Modifier.fillMaxSize().selectionDrag(assets, mode,
                         hitTest = { p -> state.layoutInfo.visibleItemsInfo.firstOrNull { Rect(it.offset.x.toFloat(), it.offset.y.toFloat(), (it.offset.x + it.size.width).toFloat(), (it.offset.y + it.size.height).toFloat()).contains(p - Offset(contentLeftPx, state.layoutInfo.beforeContentPadding.toFloat())) }?.index?.minus(headerCount) },
-                        scroll = { state.scrollBy(it) }).assetPinchZoom(mode),
+                        scroll = { state.scrollBy(it) }).assetPinchZoom(mode, skipAt = { p ->
+                            headerCount > 0 && state.layoutInfo.visibleItemsInfo.firstOrNull { it.index == 0 }?.let {
+                                LibraryLogic.isHeaderGesture(p.y, it.offset.y, it.size.height, state.layoutInfo.beforeContentPadding)
+                            } == true
+                        }),
                     contentPadding = androidx.compose.foundation.layout.PaddingValues(start = 12.dp, top = contentTop, end = 12.dp, bottom = 104.dp),
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                     verticalItemSpacing = 8.dp
@@ -1878,17 +1924,21 @@ class MainActivity : ComponentActivity() {
     }
 
     @Composable
-    private fun Modifier.assetPinchZoom(mode: AssetViewMode, folderArea: Boolean = false): Modifier {
+    private fun Modifier.assetPinchZoom(mode: AssetViewMode, folderArea: Boolean = false, skipAt: (Offset) -> Boolean = { false }): Modifier {
         val density = LocalDensity.current.density
+        val currentSkipAt by rememberUpdatedState(skipAt)
         return pointerInput(mode, folderArea, density) {
         val gallery = !folderArea && mode != AssetViewMode.LIST
         awaitEachGesture {
             var resized = false
+            var skipGesture: Boolean? = null
             do {
-                // Claim two-finger gallery gestures before scrolling/long-press consumes them.
-                val event = awaitPointerEvent(if (gallery) PointerEventPass.Initial else PointerEventPass.Main)
-                if (event.changes.count { it.pressed } >= 2 && !hasSelection() &&
-                    (gallery || event.changes.none { it.isConsumed })) {
+                // The gallery leaves headers to their own pinch handler; both beat scrolling.
+                val event = awaitPointerEvent(if (gallery || folderArea) PointerEventPass.Initial else PointerEventPass.Main)
+                val fingers = event.changes.filter { it.pressed }
+                if (fingers.size >= 2 && skipGesture == null) skipGesture = currentSkipAt(fingers.first().position)
+                if (fingers.size >= 2 && skipGesture == false && !hasSelection() &&
+                    (gallery || folderArea || event.changes.none { it.isConsumed })) {
                     val zoom = event.calculateZoom()
                     if (zoom != 1f) {
                         resized = true
@@ -1903,7 +1953,7 @@ class MainActivity : ComponentActivity() {
                         }
                         event.changes.forEach { it.consume() }
                     }
-                    if (gallery) event.changes.forEach { it.consume() }
+                    if (gallery || folderArea) event.changes.forEach { it.consume() }
                 }
             } while (event.changes.any { it.pressed })
             if (resized) saveViewerPreferences()
@@ -3562,10 +3612,11 @@ class MainActivity : ComponentActivity() {
         }
         status = if (offlineOpened) "已打开本地索引，正在后台恢复 OneDrive…" else "正在恢复 OneDrive 连接…"
         sessionRestoring = true
+        val startIndexNow = checkUpdates && offlineOpened && driveId != null
         work.execute {
             runCatching {
                 graphAccessToken()
-                finishConnected(checkUpdates || !offlineOpened, notifyCompletion = checkUpdates)
+                finishConnected((checkUpdates || !offlineOpened) && !startIndexNow, notifyCompletion = checkUpdates)
             }.onFailure { error ->
                 runOnUiThread { sessionNeedsAuthorization = error is HttpFailure && LibraryLogic.authorizationRequired(error.code) }
                 if (offlineOpened) {
@@ -3577,6 +3628,8 @@ class MainActivity : ComponentActivity() {
             }
             runOnUiThread { sessionRestoring = false }
         }
+        // Mark the check busy immediately; reads stay queued behind authentication.
+        if (startIndexNow) libraryId?.let { loadLibrary(it, libraryName.orEmpty(), false, notifyCompletion = true) }
     }
 
     private fun openOfflineLibrary(): Boolean {
@@ -4723,7 +4776,8 @@ class MainActivity : ComponentActivity() {
             add(FolderNode(
                 json.getString("id"),
                 json.getString("name"),
-                parseFolders(json.optJSONArray("children") ?: JSONArray())
+                parseFolders(json.optJSONArray("children") ?: JSONArray()),
+                json.optString("iconColor")
             ))
         }
     }
@@ -5328,7 +5382,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private data class CloudFolder(val id: String?, val name: String)
-    private data class FolderNode(val id: String, val name: String, val children: List<FolderNode>)
+    private data class FolderNode(val id: String, val name: String, val children: List<FolderNode>, val iconColor: String = "")
     private data class FolderRow(val node: FolderNode, val depth: Int)
     private data class FolderChoice(val id: String, val label: String)
     private data class DevicePrompt(val code: String, val uri: String)

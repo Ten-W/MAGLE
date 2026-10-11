@@ -4,6 +4,21 @@ import org.junit.Test;
 import static org.junit.Assert.*;
 
 public class ViewerZoomTest {
+    @Test public void folderHeaderPinchIsNotClaimedByGalleryAfterScrolling() {
+        assertTrue(LibraryLogic.isHeaderGesture(100f, 0, 200, 68));
+        assertFalse(LibraryLogic.isHeaderGesture(50f, 0, 200, 68));
+        assertFalse(LibraryLogic.isHeaderGesture(268f, 0, 200, 68));
+        assertTrue(LibraryLogic.isHeaderGesture(30f, -100, 200, 68));
+        assertFalse(LibraryLogic.isHeaderGesture(168f, -100, 200, 68));
+    }
+
+    @Test public void coldStartRefreshAcceptsSavedConnectionButNeverMissingCredentials() {
+        assertTrue(LibraryLogic.canRefreshOneDrive(false, true, true));
+        assertTrue(LibraryLogic.canRefreshOneDrive(true, false, false));
+        assertFalse(LibraryLogic.canRefreshOneDrive(false, true, false));
+        assertFalse(LibraryLogic.canRefreshOneDrive(false, false, true));
+        assertFalse(LibraryLogic.canRefreshOneDrive(false, false, false));
+    }
     @Test public void refreshWaitsForFingerRelease() {
         assertFalse(LibraryLogic.refreshAfterRelease(true, true));
         assertTrue(LibraryLogic.refreshAfterRelease(true, false));

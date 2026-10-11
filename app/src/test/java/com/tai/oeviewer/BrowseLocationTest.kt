@@ -4,6 +4,19 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class BrowseLocationTest {
+    @Test fun searchResultReturnsToExactSearchAndNestedFolderStillReturnsToParent() {
+        val search = BrowseLocation(10, LibrarySection.ALL, null, null, "全部", "Apple", false, AssetViewMode.WATERFALL)
+        val tag = search.copy(key = 11, section = LibrarySection.TAG, tag = "Apple", query = "", searchReturnKey = search.key)
+        assertEquals(search, tag.backTarget(listOf(search), "group" to "编组", 12))
+        val folder = tag.copy(key = 12, section = LibrarySection.FOLDER, tag = null, folderId = "parent")
+        assertEquals(search, folder.backTarget(listOf(search), "ancestor" to "上层", 13))
+        val child = folder.copy(key = 13, folderId = "child", searchReturnKey = null)
+        assertEquals(folder, child.backTarget(listOf(search, folder), "parent" to folder.name, 14))
+        assertEquals(search, folder.backTarget(listOf(search), null, 15))
+        // A normal sidebar destination must not replay an unrelated search.
+        assertEquals(LibrarySection.TAGGROUP, tag.copy(searchReturnKey = null).backTarget(listOf(search), "group" to "编组", 16)?.section)
+    }
+
     @Test fun folderBackOnlyFollowsHierarchyAndPreservesSavedView() {
         val all = BrowseLocation(1, LibrarySection.ALL, null, null, "全部", "", false, AssetViewMode.LIST)
         val parent = all.copy(key = 2, section = LibrarySection.FOLDER, folderId = "parent", name = "父目录")

@@ -7,13 +7,15 @@ internal enum class AssetViewMode(val label: String) {
 
 internal data class BrowseLocation(
     val key: Long, val section: LibrarySection, val folderId: String?, val tag: String?,
-    val name: String, val query: String, val includeChildren: Boolean, val mode: AssetViewMode
+    val name: String, val query: String, val includeChildren: Boolean, val mode: AssetViewMode,
+    val searchReturnKey: Long? = null
 ) {
     fun sameDestination(other: BrowseLocation) = section == other.section && folderId == other.folderId && tag == other.tag
 
     fun tagParentId(explicitGroupId: String? = null) = explicitGroupId ?: tag.takeIf { section == LibrarySection.TAGGROUP }
 
     fun backTarget(history: List<BrowseLocation>, parent: Pair<String, String>?, newKey: Long): BrowseLocation? {
+        history.lastOrNull { it.key == searchReturnKey && it.query.isNotBlank() }?.let { return it }
         val target = when (section) {
             LibrarySection.FOLDER -> if (folderId == null) return null else copy(key = newKey,
                 folderId = parent?.first, tag = null, name = parent?.second ?: "文件夹", query = "")

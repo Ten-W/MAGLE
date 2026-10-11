@@ -182,6 +182,10 @@ final class LibraryLogic {
         return pending && !pressed;
     }
 
+    static boolean canRefreshOneDrive(boolean connected, boolean hasDrive, boolean hasToken) {
+        return connected || (hasDrive && hasToken);
+    }
+
     static String refreshResultMessage(int remaining) {
         return remaining == 0 ? "刷新完成 · 索引已更新" : "刷新未完成 · 仍有 " + remaining + " 项待读取";
     }
@@ -198,6 +202,10 @@ final class LibraryLogic {
         float min = (widthDp - 16f) / 8f - 8f;
         float max = (widthDp - 16f) / 2f - 8f;
         return resizeCell(resizeCell(current, 1f, min, max), zoom, min, max);
+    }
+
+    static boolean isHeaderGesture(float y, int offset, int height, int padding) {
+        return y >= offset + padding && y < offset + padding + height;
     }
 
     static int folderColumnCount(float widthDp, float scale) {
