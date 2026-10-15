@@ -23,6 +23,7 @@ import android.util.LruCache
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.togetherWith
 import androidx.activity.result.contract.ActivityResultContracts
@@ -394,6 +395,7 @@ class MainActivity : ComponentActivity() {
     private var selectedTags by mutableStateOf<Set<String>>(emptySet())
     private var selectedTagGroupIds by mutableStateOf<Set<String>>(emptySet())
     private var renameTagOpen by mutableStateOf(false)
+    private var deleteTagsCandidate by mutableStateOf<Set<String>>(emptySet())
     private var renameFolderOpen by mutableStateOf(false)
     private var moveFoldersOpen by mutableStateOf(false)
     private var detailAssets = emptyList<AssetMeta>()
@@ -716,6 +718,17 @@ class MainActivity : ComponentActivity() {
         if (renameTagOpen) NameDialog(if (selectedTags.isNotEmpty()) "重命名标签" else "重命名标签组",
             selectedTags.singleOrNull() ?: tagGroups.firstOrNull { it.getString("id") in selectedTagGroupIds }?.getString("name").orEmpty(),
             { renameTagOpen = false }) { name -> renameTagOpen = false; renameTagSelection(name) }
+        if (deleteTagsCandidate.isNotEmpty()) AlertDialog(
+            onDismissRequest = { deleteTagsCandidate = emptySet() },
+            title = { Text("删除 ${deleteTagsCandidate.size} 个标签？") },
+            text = { Text("将从标签管理和所有素材（包括回收站）的属性中移除这些标签，不会删除素材文件。此操作无法直接撤销。") },
+            confirmButton = { TextButton(onClick = {
+                val tags = deleteTagsCandidate
+                deleteTagsCandidate = emptySet()
+                runTagRename(deleteTags = tags)
+            }, enabled = !batchBusy && canUpload()) { Text("删除标签") } },
+            dismissButton = { TextButton(onClick = { deleteTagsCandidate = emptySet() }) { Text("取消") } }
+        )
         if (renameFolderOpen) NameDialog("重命名文件夹", flatFolderTree.firstOrNull { it.id in selectedFolderIds }?.name.orEmpty(),
             { renameFolderOpen = false }) { name -> renameFolderOpen = false; changeFolders(name = name) }
         if (moveFoldersOpen) FolderPicker(emptySet(), false, { moveFoldersOpen = false }, rootLabel = "库根目录") { target ->
@@ -921,6 +934,9 @@ class MainActivity : ComponentActivity() {
                         SelectionLabel(selectedTags.size + selectedTagGroupIds.size, if (selectedTags.isNotEmpty()) "标签" else "标签组", Modifier.weight(1f))
                         SelectionAction(onClick = { downloadTagSelection() }, enabled = !batchBusy) { Icon(painterResource(R.drawable.ic_download_24), "下载标签内原文件", Modifier.size(20.dp)) }
                         SelectionAction(onClick = { renameTagOpen = true }, enabled = !batchBusy && canUpload() && selectedTags.size + selectedTagGroupIds.size == 1 && "magle:ungrouped" !in selectedTagGroupIds) { Icon(Icons.Default.Edit, "重命名标签或标签组", Modifier.size(20.dp)) }
+                        if (selectedTags.isNotEmpty()) SelectionAction(onClick = { deleteTagsCandidate = selectedTags.toSet() }, enabled = !batchBusy && canUpload()) {
+                            Icon(painterResource(R.drawable.ic_delete_24), "删除标签", Modifier.size(20.dp))
+                        }
                     } else if (selectedAssetIds.isNotEmpty()) {
                         SelectionLabel(selectedAssetIds.size, "素材", Modifier.weight(1f))
                         if (batchBusy) CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
@@ -1351,7 +1367,7 @@ class MainActivity : ComponentActivity() {
         }
         if (clean == old) return
         if (tagRenameFile().baseFile.exists()) {
-            Toast.makeText(this, "还有未完成的标签改名，请先在设置中继续", Toast.LENGTH_LONG).show()
+            Toast.makeText(this, "还有未完成的标签编辑，请先在设置中继续", Toast.LENGTH_LONG).show()
             return
         }
         if (indexedAssets.any { clean in it.tags } || tagGroups.any { clean in jsonStrings(it, "tags") }) {
@@ -1361,19 +1377,25 @@ class MainActivity : ComponentActivity() {
         runTagRename(old, clean)
     }
 
-    private fun runTagRename(old: String? = null, name: String? = null) {
+    private fun runTagRename(old: String? = null, name: String? = null, deleteTags: Set<String> = emptySet()) {
         if (batchBusy || !canUpload()) return
+        if ((old != null || deleteTags.isNotEmpty()) && tagRenameFile().baseFile.exists()) {
+            Toast.makeText(this, "还有未完成的标签编辑，请先在设置中继续", Toast.LENGTH_LONG).show()
+            return
+        }
+        val deleting = deleteTags.isNotEmpty()
         batchBusy = true
         attemptedTagResume = true
-        tagRenameStatus = "正在准备标签改名…"
+        tagRenameStatus = "正在准备标签编辑…"
         queueEdit {
             val changed = mutableMapOf<String, AssetMeta>()
             var task = pendingTagRename()
             val snapshot = editSnapshot()
             val result = runCatching {
                 if (task == null) {
-                    check(old != null && name != null && !tagRenameFile().baseFile.exists()) { "未完成任务属于其他素材库，请切换到原库继续" }
-                    val allIds = listAssetIds(libraryId!!) - loadIgnoredIndexCache().keys
+                    check((deleting || (old != null && name != null)) && !tagRenameFile().baseFile.exists()) { "未完成任务属于其他素材库，请切换到原库继续" }
+                    deleteTags.forEach { LibraryLogic.validTagName(it) }
+                    val allIds = listAssetIds(libraryId!!).let { if (deleting) it else it - loadIgnoredIndexCache().keys }
                     val ids = mutableListOf<String>()
                     // Preflight the whole library, including uncached items, before any tag is changed.
                     for (chunk in allIds.chunked(8)) {
@@ -1381,24 +1403,33 @@ class MainActivity : ComponentActivity() {
                         try {
                             for (read in reads) {
                                 val asset = read.get() ?: continue
-                                check(name !in asset.tags) { "这个标签名已存在，请使用其他名称；尚未修改素材" }
-                                if (old in asset.tags) ids += asset.id
+                                if (!deleting) check(name !in asset.tags) { "这个标签名已存在，请使用其他名称；尚未修改素材" }
+                                if (if (deleting) asset.tags.any { it in deleteTags } else old in asset.tags) ids += asset.id
                             }
                         } finally { reads.filterNot { it.isDone }.forEach { it.cancel(true) } }
                     }
                     val root = JSONObject(String(readLibraryFile(libraryId!!, "metadata.json"), StandardCharsets.UTF_8))
-                    check(LibraryLogic.tagGroups(root).none { name in jsonStrings(it, "tags") }) { "这个标签名已存在，请使用其他名称" }
+                    if (!deleting) check(LibraryLogic.tagGroups(root).none { name in jsonStrings(it, "tags") }) { "这个标签名已存在，请使用其他名称" }
                     task = TagRenameTask(JSONObject().put("source", source.name).put("libraryId", libraryId)
-                        .put("driveId", driveId.orEmpty()).put("old", old).put("name", name)
+                        .put("driveId", driveId.orEmpty()).put("old", if (deleting) deleteTags.first() else old).put("name", if (deleting) "" else name)
+                        .put("deleteTags", JSONArray(deleteTags))
                         .put("ids", JSONArray(ids)).put("done", JSONArray()))
                     saveTagRename(task)
                 }
                 val current = task
                 val done = current.done
-                for (id in current.ids.filterNot { it in done }) {
+                // Deletion rechecks completed items too: a crash may precede the local cache update.
+                for (id in if (current.deleting) current.ids else current.ids.filterNot { it in done }) {
                     if (Thread.currentThread().isInterrupted) throw InterruptedException()
                     val asset = fetchAssetMetadata(id, 0)
-                    if (asset != null && current.old in asset.tags) {
+                    if (current.deleting && asset != null) {
+                        if (asset.tags.any { it in current.deletedTags }) {
+                            changed[id] = mutateAssetNow(asset) { LibraryLogic.deleteTagReferences(it, current.deletedTags) }
+                        } else {
+                            mergeLibraryMtime(id, maxOf(asset.mtime, System.currentTimeMillis()))
+                            changed[id] = asset
+                        }
+                    } else if (asset != null && current.old in asset.tags) {
                         if (current.name in asset.tags) throw LibraryConflict("同一素材已有新旧两个标签，为避免误合并，请先核对")
                         // Replay even an already-renamed item: repair its manifest after a lost response.
                         changed[id] = mutateAssetNow(asset) { LibraryLogic.renameTagReferences(it, current.old, current.name) }
@@ -1409,13 +1440,15 @@ class MainActivity : ComponentActivity() {
                     }
                     current.complete(id)
                     saveTagRename(current)
-                    val progress = "标签改名：已处理 ${current.done.size}/${current.ids.size} 项"
+                    val progress = "${current.label}：已处理 ${current.done.size}/${current.ids.size} 项"
                     runOnUiThread { tagRenameStatus = progress }
                 }
                 val metadata = mutateLibraryNow {
                     val tags = LibraryLogic.tagGroups(it).flatMap { group -> jsonStrings(group, "tags") }
-                    if (current.old in tags && current.name in tags) throw LibraryConflict("标签组已同时包含新旧标签，请先核对，进度已保留")
-                    LibraryLogic.renameTagReferences(it, current.old, current.name)
+                    if (current.deleting) LibraryLogic.deleteTagReferences(it, current.deletedTags) else {
+                        if (current.old in tags && current.name in tags) throw LibraryConflict("标签组已同时包含新旧标签，请先核对，进度已保留")
+                        LibraryLogic.renameTagReferences(it, current.old, current.name)
+                    }
                 }
                 tagRenameFile().delete()
                 metadata
@@ -1430,19 +1463,25 @@ class MainActivity : ComponentActivity() {
                 result.onSuccess {
                     tagGroups = LibraryLogic.tagGroups(it)
                     val current = task!!
-                    browseHistory = browseHistory.map { location ->
-                        if (location.section == LibrarySection.TAG && location.tag == current.old)
-                            location.copy(tag = current.name, name = current.name) else location
-                    }
-                    if (selectedSection == LibrarySection.TAG && selectedTag == current.old) {
-                        selectedTag = current.name; selectedFolderName = current.name
+                    if (current.deleting) {
+                        browseHistory = browseHistory.filterNot { it.section == LibrarySection.TAG && it.tag in current.deletedTags }
+                        if (selectedSection == LibrarySection.TAG && selectedTag in current.deletedTags)
+                            navigateBrowse(LibrarySection.TAGGROUPS, null, null, "标签管理")
+                    } else {
+                        browseHistory = browseHistory.map { location ->
+                            if (location.section == LibrarySection.TAG && location.tag == current.old)
+                                location.copy(tag = current.name, name = current.name) else location
+                        }
+                        if (selectedSection == LibrarySection.TAG && selectedTag == current.old) {
+                            selectedTag = current.name; selectedFolderName = current.name
+                        }
                     }
                     tagRenameStatus = ""
                     clearSelection()
-                    Toast.makeText(this, "标签改名完成", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(this, "${current.label}完成", Toast.LENGTH_SHORT).show()
                 }.onFailure {
-                    tagRenameStatus = if (pendingTagRename() != null) "标签改名未完成，进度已保留：${it.message}"
-                        else "标签改名尚未开始：${it.message}"
+                    tagRenameStatus = if (pendingTagRename() != null) "标签编辑未完成，进度已保留：${it.message}"
+                        else "标签编辑尚未开始：${it.message}"
                     Toast.makeText(this, tagRenameStatus, Toast.LENGTH_LONG).show()
                 }
             }
@@ -2143,7 +2182,9 @@ class MainActivity : ComponentActivity() {
                 Row(Modifier.fillMaxWidth().height(48.dp).padding(start = 16.dp), verticalAlignment = Alignment.CenterVertically) {
                     Text("素材详情", Modifier.weight(1f), style = MaterialTheme.typography.titleMedium)
                 }
-                if (colors.isNotEmpty()) Row(Modifier.fillMaxWidth().padding(start = 16.dp, end = 16.dp, bottom = 8.dp), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                if (colors.isNotEmpty()) Row(Modifier.padding(start = 16.dp, end = 16.dp, bottom = 8.dp)
+                    .border(1.dp, MaterialTheme.colorScheme.outlineVariant, CircleShape)
+                    .horizontalScroll(rememberScrollState()).padding(horizontal = 10.dp, vertical = 8.dp), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                     colors.forEach { color ->
                         Box(Modifier.size(18.dp).background(androidx.compose.ui.graphics.Color(color), CircleShape)
                             .border(1.dp, MaterialTheme.colorScheme.outlineVariant, CircleShape))
@@ -2948,9 +2989,9 @@ class MainActivity : ComponentActivity() {
                     if (pendingRename != null || tagRenameStatus.isNotBlank()) {
                         Card(Modifier.fillMaxWidth()) {
                             Column(Modifier.padding(16.dp)) {
-                                Text("标签改名任务", style = MaterialTheme.typography.titleMedium)
+                                Text("标签编辑任务", style = MaterialTheme.typography.titleMedium)
                                 Text(tagRenameStatus.ifBlank { "已处理 ${pendingRename!!.done.size}/${pendingRename.ids.size} 项，进度已保存" })
-                                if (pendingRename != null) TextButton(onClick = { runTagRename() }, enabled = !batchBusy && canUpload()) { Text("继续改名") }
+                                if (pendingRename != null) TextButton(onClick = { runTagRename() }, enabled = !batchBusy && canUpload()) { Text("继续处理") }
                             }
                         }
                     }

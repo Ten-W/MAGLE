@@ -38,8 +38,13 @@ internal fun mergeMtime(json: JSONObject, id: String, now: Long) {
 }
 
 /** A durable list of item IDs, not a count: a lost response is safe to replay. */
-// ponytail: one global rename task at a time; per-library queues only if simultaneous bulk editing is needed.
+// ponytail: one durable tag edit task at a time; per-library queues only if simultaneous bulk editing is needed.
 internal class TagRenameTask(val json: JSONObject) {
+    val deletedTags: Set<String> = json.optJSONArray("deleteTags")?.let { array ->
+        (0 until array.length()).map { array.getString(it) }.toSet()
+    }.orEmpty()
+    val deleting: Boolean get() = deletedTags.isNotEmpty()
+    val label: String get() = if (deleting) "标签删除" else "标签改名"
     val old: String get() = json.getString("old")
     val name: String get() = json.getString("name")
     val ids: List<String> = strings("ids")
@@ -47,7 +52,7 @@ internal class TagRenameTask(val json: JSONObject) {
     val done: Set<String> get() = completed.toSet()
     init {
         LibraryLogic.validTagName(old)
-        LibraryLogic.validTagName(name)
+        if (deleting) deletedTags.forEach { LibraryLogic.validTagName(it) } else LibraryLogic.validTagName(name)
         require(ids.size == ids.distinct().size && ids.all { it.matches(Regex("[A-Za-z0-9_-]{1,128}")) })
         require(completed.all { it in ids })
     }

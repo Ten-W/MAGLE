@@ -94,7 +94,7 @@ public class ReleaseSmokeInstrumentation extends Instrumentation {
                 finish(Activity.RESULT_OK, result); return;
             }
             require((context.getApplicationInfo().flags & ApplicationInfo.FLAG_DEBUGGABLE) == 0, "Expected non-debuggable package");
-            require("0.8.76".equals(context.getPackageManager().getPackageInfo(context.getPackageName(), 0).versionName), "Wrong version");
+            require("0.8.77".equals(context.getPackageManager().getPackageInfo(context.getPackageName(), 0).versionName), "Wrong version");
             if ("true".equals(arguments.getString("testAppDownload"))) {
                 startActivitySync(new Intent().setClassName(context.getPackageName(), context.getPackageName() + ".MainActivity").addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
                 waitForIdleSync();

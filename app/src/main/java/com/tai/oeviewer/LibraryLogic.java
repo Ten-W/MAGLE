@@ -150,6 +150,22 @@ final class LibraryLogic {
         return new java.util.ArrayList<>(new LinkedHashSet<>(values));
     }
 
+    static List<String> deleteTagReferences(JSONObject metadata, Set<String> deleted) throws org.json.JSONException {
+        for (String tag : deleted) validTagName(tag);
+        List<String> values = new java.util.ArrayList<>();
+        JSONArray tags = metadata.optJSONArray("tags");
+        if (tags != null) {
+            for (int i = 0; i < tags.length(); i++) if (!deleted.contains(tags.getString(i))) values.add(tags.getString(i));
+            metadata.put("tags", new JSONArray(values));
+        }
+        JSONArray groups = metadata.optJSONArray("tagsGroups");
+        if (groups != null) for (int i = 0; i < groups.length(); i++) {
+            JSONObject group = groups.optJSONObject(i);
+            if (group != null) deleteTagReferences(group, deleted);
+        }
+        return values;
+    }
+
     static String validTagName(String raw) {
         String name = raw.trim();
         if (name.isEmpty() || name.length() > 150 || name.chars().anyMatch(Character::isISOControl))

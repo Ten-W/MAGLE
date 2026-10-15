@@ -14,8 +14,8 @@ android {
         applicationId = "com.tai.oeviewer"
         minSdk = 29
         targetSdk = 36
-        versionCode = 100
-        versionName = "0.8.76"
+        versionCode = 101
+        versionName = "0.8.77"
         testInstrumentationRunner = "com.tai.oeviewer.ReleaseSmokeInstrumentation"
         // MAGLE's public client registration; existing OE Link tokens remain isolated.
         val oneDriveId = providers.gradleProperty("magleOneDriveClientId")

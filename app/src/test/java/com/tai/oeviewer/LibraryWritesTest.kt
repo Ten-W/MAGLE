@@ -6,6 +6,34 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class LibraryWritesTest {
+    @Test fun batchTagDeletionIsResumableAndPreservesFilesGroupsAndOtherTags() {
+        val task = TagRenameTask(JSONObject().put("source", "LOCAL").put("libraryId", "test-library")
+            .put("old", "A").put("name", "").put("deleteTags", JSONArray(listOf("A", "B")))
+            .put("ids", JSONArray(listOf("one", "two"))).put("done", JSONArray()))
+        val asset = JSONObject("""{"tags":["A","Keep","B"],"folders":["F"],"name":"photo","isDeleted":true}""")
+        LibraryLogic.deleteTagReferences(asset, task.deletedTags)
+        assertEquals(listOf("Keep"), (0 until asset.getJSONArray("tags").length()).map { asset.getJSONArray("tags").getString(it) })
+        assertEquals("F", asset.getJSONArray("folders").getString(0))
+        assertEquals("photo", asset.getString("name"))
+        assertTrue(asset.getBoolean("isDeleted"))
+        val once = asset.toString()
+        LibraryLogic.deleteTagReferences(asset, task.deletedTags)
+        assertEquals(once, asset.toString())
+        task.complete("one")
+        val resumed = TagRenameTask(JSONObject(task.json.toString()))
+        assertTrue(resumed.deleting)
+        assertEquals(setOf("A", "B"), resumed.deletedTags)
+        assertEquals(listOf("two"), resumed.ids.filterNot { it in resumed.done })
+        val library = JSONObject("""{"tagsGroups":[{"id":"G","color":"red","tags":["A","Keep","B"]},{"id":"H","tags":["B"]}],"folders":[{"id":"F"}]}""")
+        LibraryLogic.deleteTagReferences(library, resumed.deletedTags)
+        val groups = library.getJSONArray("tagsGroups")
+        assertEquals("Keep", groups.getJSONObject(0).getJSONArray("tags").getString(0))
+        assertEquals("red", groups.getJSONObject(0).getString("color"))
+        assertEquals(0, groups.getJSONObject(1).getJSONArray("tags").length())
+        assertEquals("F", library.getJSONArray("folders").getJSONObject(0).getString("id"))
+        assertFalse(resumed.matches("LOCAL", "other-library", null))
+    }
+
     @Test fun conflictDoesNotReplayAnEditButManifestRebasesAndPreservesOthers() {
         var current = "{\"other\":77,\"all\":77}".toByteArray()
         var revision = 1
