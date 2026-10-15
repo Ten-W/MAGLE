@@ -1,14 +1,14 @@
 [
   {
-    "tag_name": "v0.8.76",
-    "html_url": "https://github.com/Ten-W/MAGLE/releases/tag/v0.8.76",
-    "body": "精简正式版，约 7.1 MB。修复冷启动首次刷新、搜索结果返回和文件夹独立双指缩放；统一搜索标签/文件夹样式，显示 Eagle 文件夹颜色。沿用兼容签名，请覆盖更新，不要卸载。",
+    "tag_name": "v0.8.77",
+    "html_url": "https://github.com/Ten-W/MAGLE/releases/tag/v0.8.77",
+    "body": "精简正式版，约 7.1 MB。新增标签批量删除与二次确认，同时从素材属性移除标签，不删除素材文件；支持中断后继续处理。素材详情的颜色圆点增加胶囊边框。删除不可直接撤销，请避免其他设备同时编辑相关标签。沿用兼容签名，请覆盖更新，不要卸载。",
     "assets": [
       {
-        "name": "MAGLE-v0.8.76-release.apk",
-        "browser_download_url": "https://github.com/Ten-W/MAGLE/releases/download/v0.8.76/MAGLE-v0.8.76-release.apk",
+        "name": "MAGLE-v0.8.77-release.apk",
+        "browser_download_url": "https://github.com/Ten-W/MAGLE/releases/download/v0.8.77/MAGLE-v0.8.77-release.apk",
         "size": 7411985,
-        "digest": "sha256:d41c063d854a146aff62f2dc244326fe105da77c6928f9c611b4d0aa137f7daf"
+        "digest": "sha256:bb8f75998b3309721c9c0e54bf68e0e665c78fddb4322b0d068cc36f54a36800"
       }
     ]
   }
