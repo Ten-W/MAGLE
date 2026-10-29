@@ -10,8 +10,6 @@ import java.util.zip.ZipOutputStream
 
 internal data class ImportedIndex(val index: JSONObject, val folders: JSONObject, val directory: File)
 
-// Eagle copies can have IDs such as MKIFXUOKFRRU7(1); keep path separators and dots forbidden.
-private val backupAssetId = Regex("[A-Za-z0-9_()-]{1,128}")
 private const val BACKUP_LIMIT = 256L * 1024 * 1024
 
 /** Only index data and cached thumbnails; never serialize connection records or credentials. */
@@ -45,7 +43,7 @@ internal fun writeIndexBackup(output: OutputStream, index: JSONObject, folders: 
         entry("index.json", copy.toString().byteInputStream())
         entry("folders.json", folders.toString().byteInputStream())
         items.keys().forEach { id ->
-            require(backupAssetId.matches(id)) { "不支持的素材 ID" }
+            require(LibraryLogic.validAssetId(id)) { "不支持的素材 ID" }
             thumbnail(id, items.getJSONObject(id).getLong("mtime"))?.takeIf(File::isFile)?.let {
                 entry("thumbnails/$id.thumb", it.inputStream())
             }
@@ -66,7 +64,7 @@ internal fun readIndexBackup(input: InputStream, directory: File): ImportedIndex
                 val asset = name.removePrefix("thumbnails/").removeSuffix(".thumb")
                 require(!entry.isDirectory && names.add(name) &&
                     (name in setOf("backup.json", "index.json", "folders.json") ||
-                        name == "thumbnails/$asset.thumb" && backupAssetId.matches(asset))) { "不是有效的 MAGLE 索引备份" }
+                        name == "thumbnails/$asset.thumb" && LibraryLogic.validAssetId(asset))) { "不是有效的 MAGLE 索引备份" }
                 val file = File(directory, name)
                 file.parentFile!!.mkdirs()
                 file.outputStream().use { output ->
@@ -86,7 +84,7 @@ internal fun readIndexBackup(input: InputStream, directory: File): ImportedIndex
         val header = JSONObject(File(directory, "backup.json").readText())
         require(header.optString("format") == "MAGLE-index" && header.optInt("version") == 1) { "不支持的备份格式" }
         val index = JSONObject(File(directory, "index.json").readText())
-        require(index.optInt("schemaVersion") == 2 && index.getJSONObject("items").keys().asSequence().all(backupAssetId::matches)) { "无效索引" }
+        require(index.optInt("schemaVersion") == 2 && index.getJSONObject("items").keys().asSequence().all(LibraryLogic::validAssetId)) { "无效索引" }
         val items = index.getJSONObject("items")
         require(names.filter { it.startsWith("thumbnails/") }.all { items.has(it.removePrefix("thumbnails/").removeSuffix(".thumb")) }) { "缩略图与索引不匹配" }
         items.keys().forEach { id ->

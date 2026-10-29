@@ -4,10 +4,23 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class SettingsLayoutTest {
+    @Test fun appearanceUsesSavedModesAndSystemToastsAndNativeAnimations() {
+        val source = java.io.File("src/main/java/com/tai/oeviewer/MainActivity.kt").readText()
+        assertTrue(source.contains("viewerPrefs.getInt(\"themeMode\", 0)"))
+        assertTrue(source.contains("putInt(\"themeMode\", themeMode)"))
+        assertTrue(source.contains("SettingsAppearance()"))
+        assertTrue(source.contains("dynamicDarkColorScheme(this)"))
+        assertTrue(source.contains("跟随壁纸"))
+        assertFalse(source.contains("setGravity("))
+        assertTrue(source.contains("expandVertically(tween(180))"))
+        assertTrue(source.contains("AnimatedVisibility(folderGroupOpen, enter = expandVertically(tween(180))"))
+        assertFalse(source.contains("48.dp * folderReveal"))
+    }
+
     @Test fun backupLivesWithLibrariesAndSourcesKeepRequestedOrder() {
         val source = java.io.File("src/main/java/com/tai/oeviewer/MainActivity.kt").readText()
         assertFalse(source.contains("SettingsIndexBackup"))
-        val settings = source.substringAfter("private fun SettingsScreen()").substringBefore("private fun SettingsAbout()")
+        val settings = source.substringAfter("private fun SettingsScreen(").substringBefore("private fun SettingsAbout()")
         assertEquals(2, Regex("SettingsLibraries\\(\\)\\s+SettingsIndexUpdate\\(\\)").findAll(settings).count())
         val libraries = source.substringAfter("private fun SettingsLibraries()").substringBefore("private fun SettingsCache()")
         assertTrue(libraries.indexOf("更新当前库索引") < libraries.indexOf("导出索引备份"))

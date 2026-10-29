@@ -29,7 +29,7 @@ public class UploadLogicTest {
     }
 
     @Test public void restrictsUnencryptedWebDavToLiteralPrivateAddresses() {
-        assertTrue(UploadLogic.isPrivateHttpUrl("http://192.168.1.10:8090/dav/test/"));
+        assertTrue(UploadLogic.isPrivateHttpUrl("http://192.168.31.211:8090/dav/test/"));
         assertTrue(UploadLogic.isPrivateHttpUrl("http://10.0.0.1/"));
         assertTrue(UploadLogic.isPrivateHttpUrl("http://172.31.0.1/"));
         for (String url : java.util.List.of("http://8.8.8.8/", "http://172.32.0.1/", "http://example.com/", "http://192.168.1.256/", "http://user:pass@192.168.1.1/", "http://192.168.1.1/?token=x", "http://192.168.1.1.evil.com/"))

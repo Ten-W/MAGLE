@@ -15,10 +15,6 @@ final class TokenStore {
     private static final String ALIAS = "oe-viewer-refresh-token";
     private static final String PREFS = "secure-auth";
 
-    static void save(Context context, String token) throws Exception {
-        saveSecret(context, "token", token);
-    }
-
     static void saveSecret(Context context, String name, String value) throws Exception {
         Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
         cipher.init(Cipher.ENCRYPT_MODE, key());

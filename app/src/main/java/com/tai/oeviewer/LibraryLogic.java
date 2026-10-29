@@ -9,6 +9,12 @@ import org.json.JSONObject;
 import org.json.JSONArray;
 
 final class LibraryLogic {
+    // Synced Eagle copies may use IDs such as MKIFXUOKFRRU7(1); never allow path segments.
+    private static final java.util.regex.Pattern ASSET_ID = java.util.regex.Pattern.compile("[A-Za-z0-9_()-]{1,128}");
+    static boolean validAssetId(String id) {
+        return id != null && ASSET_ID.matcher(id).matches();
+    }
+
     static boolean authorizationRequired(int httpStatus) {
         return httpStatus == 400 || httpStatus == 401 || httpStatus == 403;
     }
@@ -68,10 +74,6 @@ final class LibraryLogic {
 
     static boolean isViewableImage(String extension) {
         return extension != null && IMAGE_EXTENSIONS.contains(extension.toLowerCase(Locale.ROOT));
-    }
-
-    static boolean belongsToFolder(Set<String> folders, String selectedFolderId) {
-        return selectedFolderId == null || folders.contains(selectedFolderId);
     }
 
     static Set<String> refreshItemIds(Collection<String> manifestIds, JSONArray unlisted) throws org.json.JSONException {
@@ -238,6 +240,45 @@ final class LibraryLogic {
         return name;
     }
 
+    static String creationTarget(String section, String selectedId, boolean folder) {
+        return (folder ? "FOLDER" : "TAGGROUP").equals(section)
+                && selectedId != null && !selectedId.equals("magle:ungrouped") ? selectedId : null;
+    }
+
+    static void createFolder(JSONObject metadata, String id, String rawName, String parentId) throws org.json.JSONException {
+        String name = validName(rawName);
+        JSONArray roots = metadata.getJSONArray("folders");
+        if (id == null || id.isEmpty() || findFolder(roots, id) != null) throw new IllegalArgumentException("文件夹编号重复");
+        JSONObject parent = parentId == null ? null : findFolder(roots, parentId);
+        if (parentId != null && parent == null) throw new IllegalArgumentException("上级文件夹已不存在，请更新索引");
+        JSONArray siblings = parent == null ? roots : parent.optJSONArray("children");
+        if (siblings != null) for (int i = 0; i < siblings.length(); i++) {
+            if (siblings.getJSONObject(i).optString("name").equalsIgnoreCase(name)) throw new IllegalArgumentException("此位置已有同名文件夹");
+        }
+        JSONObject node = new JSONObject().put("id", id).put("name", name).put("children", new JSONArray())
+                .put("description", "").put("tags", new JSONArray()).put("modificationTime", System.currentTimeMillis());
+        if (siblings == null) { siblings = new JSONArray(); parent.put("children", siblings); }
+        siblings.put(node);
+    }
+
+    static void createTag(JSONObject metadata, String rawName, String groupId) throws org.json.JSONException {
+        String name = validTagName(rawName);
+        List<String> existing = new java.util.ArrayList<>();
+        JSONArray loose = metadata.optJSONArray("tags");
+        if (loose != null) for (int i = 0; i < loose.length(); i++) existing.add(loose.getString(i));
+        JSONObject target = null;
+        JSONArray groups = metadata.optJSONArray("tagsGroups");
+        if (groups != null) for (int i = 0; i < groups.length(); i++) {
+            JSONObject group = groups.getJSONObject(i);
+            if (group.optString("id", "group-" + i).equals(groupId)) target = group;
+            JSONArray tags = group.optJSONArray("tags");
+            if (tags != null) for (int j = 0; j < tags.length(); j++) existing.add(tags.getString(j));
+        }
+        if (groupId != null && target == null) throw new IllegalArgumentException("标签群组已不存在，请更新索引");
+        if (existing.contains(name)) throw new IllegalArgumentException("这个标签已存在");
+        appendTags(target == null ? metadata : target, List.of(name));
+    }
+
     static void changeFolders(JSONObject metadata, Set<String> ids, String parentId, String name) throws org.json.JSONException {
         if (ids.isEmpty()) throw new IllegalArgumentException("没有选中的文件夹");
         JSONArray roots = metadata.getJSONArray("folders");
@@ -271,7 +312,7 @@ final class LibraryLogic {
         for (JSONObject node : selected) destination.put(node);
     }
 
-    private static JSONObject findFolder(JSONArray nodes, String id) {
+    static JSONObject findFolder(JSONArray nodes, String id) {
         for (int i = 0; i < nodes.length(); i++) {
             JSONObject node = nodes.optJSONObject(i);
             if (node == null) continue;
@@ -290,6 +331,109 @@ final class LibraryLogic {
             if (ids.contains(node.optString("id"))) nodes.remove(i);
             else if (node.optJSONArray("children") != null) detachFolders(node.optJSONArray("children"), ids);
         }
+    }
+
+    static final List<String> ICON_COLORS = List.of("", "red", "orange", "yellow", "green", "aqua", "blue", "purple", "pink", "gray");
+
+    static void setFolderIcons(JSONObject metadata, Set<String> ids, String icon) throws org.json.JSONException {
+        if (icon == null || !icon.matches("[a-z0-9-]{0,48}") || ids.isEmpty()) throw new IllegalArgumentException("无效图标或未选择文件夹");
+        JSONArray roots = metadata.getJSONArray("folders");
+        for (String id : ids) if (findFolder(roots, id) == null) throw new IllegalArgumentException("文件夹已不存在");
+        for (String id : ids) {
+            JSONObject folder = findFolder(roots, id);
+            if (icon.isEmpty()) folder.remove("icon"); else folder.put("icon", icon);
+        }
+    }
+
+    static void setFolderColors(JSONObject metadata, Set<String> ids, String color) throws org.json.JSONException {
+        if (!ICON_COLORS.contains(color) || ids.isEmpty()) throw new IllegalArgumentException("无效颜色或未选择文件夹");
+        JSONArray roots = metadata.getJSONArray("folders");
+        for (String id : ids) if (findFolder(roots, id) == null) throw new IllegalArgumentException("文件夹已不存在");
+        for (String id : ids) findFolder(roots, id).put("iconColor", color);
+    }
+
+    static void moveTags(JSONObject metadata, Set<String> tags, String destination) throws org.json.JSONException {
+        for (String tag : tags) validTagName(tag);
+        JSONArray groups = metadata.optJSONArray("tagsGroups");
+        JSONObject target = null;
+        if (groups != null) for (int i = 0; i < groups.length(); i++) {
+            JSONObject group = groups.getJSONObject(i);
+            if (group.optString("id", "group-" + i).equals(destination)) target = group;
+        }
+        if (destination != null && target == null) throw new IllegalArgumentException("目标标签群组已不存在");
+        if (groups != null) for (int i = 0; i < groups.length(); i++) deleteTagReferences(groups.getJSONObject(i), tags);
+        appendTags(target == null ? metadata : target, List.copyOf(tags));
+    }
+
+    static void setTagGroupColors(JSONObject metadata, Set<String> ids, String color) throws org.json.JSONException {
+        if (!ICON_COLORS.contains(color) || ids.isEmpty()) throw new IllegalArgumentException("请先把未分组标签移入群组，再编辑群组颜色");
+        JSONArray groups = metadata.optJSONArray("tagsGroups");
+        Set<String> found = new LinkedHashSet<>();
+        if (groups != null) for (int i = 0; i < groups.length(); i++) {
+            JSONObject group = groups.getJSONObject(i);
+            if (ids.contains(group.optString("id", "group-" + i))) found.add(group.optString("id", "group-" + i));
+        }
+        if (!found.equals(ids)) throw new IllegalArgumentException("标签群组已不存在");
+        for (int i = 0; i < groups.length(); i++) {
+            JSONObject group = groups.getJSONObject(i);
+            if (ids.contains(group.optString("id", "group-" + i))) group.put("color", color);
+        }
+    }
+
+    static JSONArray folderDeletionSnapshot(JSONObject metadata, Set<String> selected) throws org.json.JSONException {
+        if (selected.isEmpty()) throw new IllegalArgumentException("没有选中的文件夹");
+        JSONArray roots = metadata.getJSONArray("folders"), snapshot = new JSONArray();
+        for (String id : selected) {
+            JSONObject folder = findFolder(roots, id);
+            if (folder == null) throw new IllegalArgumentException("文件夹已不存在，请更新索引");
+            boolean nested = false;
+            for (String other : selected) if (!id.equals(other)) {
+                JSONObject ancestor = findFolder(roots, other);
+                if (ancestor != null && findFolder(ancestor.optJSONArray("children") == null ? new JSONArray() : ancestor.getJSONArray("children"), id) != null) nested = true;
+            }
+            if (!nested) snapshot.put(new JSONObject(folder.toString()));
+        }
+        return snapshot;
+    }
+
+    static Set<String> folderIds(JSONArray roots) {
+        Set<String> ids = new LinkedHashSet<>();
+        for (int i = 0; i < roots.length(); i++) {
+            JSONObject node = roots.optJSONObject(i);
+            if (node == null) continue;
+            ids.add(node.optString("id"));
+            if (node.optJSONArray("children") != null) ids.addAll(folderIds(node.optJSONArray("children")));
+        }
+        return ids;
+    }
+
+    static void removeFolders(JSONObject metadata, JSONArray snapshot) throws org.json.JSONException {
+        JSONArray roots = metadata.getJSONArray("folders");
+        Set<String> removedRoots = new LinkedHashSet<>();
+        for (int i = 0; i < snapshot.length(); i++) {
+            JSONObject original = snapshot.getJSONObject(i);
+            String id = original.getString("id");
+            JSONObject current = findFolder(roots, id);
+            if (current != null && !current.toString().equals(original.toString()))
+                throw new IllegalArgumentException("文件夹已被其他设备修改，已保留任务，请先核对");
+            if (current == null) for (String child : folderIds(new JSONArray().put(original)))
+                if (findFolder(roots, child) != null) throw new IllegalArgumentException("子文件夹已被移动，未删除");
+            removedRoots.add(id);
+        }
+        detachFolders(roots, removedRoots);
+    }
+
+    static void removeFolderReferences(JSONObject asset, Set<String> ids, boolean recycle) throws org.json.JSONException {
+        JSONArray folders = asset.optJSONArray("folders");
+        if (folders == null) return;
+        Set<String> remaining = new LinkedHashSet<>();
+        boolean affected = false;
+        for (int i = 0; i < folders.length(); i++) {
+            String id = folders.getString(i);
+            if (ids.contains(id)) affected = true; else remaining.add(id);
+        }
+        asset.put("folders", new JSONArray(remaining));
+        if (affected && recycle) setRecycled(asset, "回收站");
     }
 
     static boolean isTransientThumbnailFailure(int httpStatus) {

@@ -63,11 +63,7 @@ internal class AppDownload(private val context: Context) {
         val apk = file(release)
         check(apk.length() == release.size) { "安装包不完整，请重新下载" }
         if (release.digest.isNotBlank()) {
-            val hash = java.security.MessageDigest.getInstance("SHA-256")
-            apk.inputStream().use { input -> val buffer = ByteArray(65536); while (true) {
-                val count = input.read(buffer); if (count < 0) break; hash.update(buffer, 0, count)
-            } }
-            check("sha256:" + hash.digest().joinToString("") { "%02x".format(it) } == release.digest) { "安装包校验失败，请重新下载" }
+            check(appFileDigest(apk) == release.digest) { "安装包校验失败，请重新下载" }
         }
         val pm = context.packageManager
         val archive = checkNotNull(pm.getPackageArchiveInfo(apk.path, PackageManager.GET_SIGNING_CERTIFICATES)) { "无法读取安装包" }

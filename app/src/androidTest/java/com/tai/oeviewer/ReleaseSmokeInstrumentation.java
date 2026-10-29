@@ -29,6 +29,35 @@ public class ReleaseSmokeInstrumentation extends Instrumentation {
         Bundle result = new Bundle();
         try {
             Context context = getTargetContext();
+            if ("true".equals(arguments.getString("testOptimisticCategory"))) {
+                var monitor = addMonitor(context.getPackageName() + ".MainActivity", null, false);
+                context.startActivity(new Intent().setClassName(context.getPackageName(), context.getPackageName() + ".MainActivity").addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
+                Activity activity = waitForMonitorWithTimeout(monitor, 30000);
+                require(activity != null, "Activity did not open");
+                testOptimisticCategory(activity);
+                result.putString("result", "PASS: immediate folder preview, cancel selection, browse during save, failure restores original metadata and title; no cloud write");
+                finish(Activity.RESULT_OK, result); return;
+            }
+            if ("true".equals(arguments.getString("testCreationUpload"))) {
+                var monitor = addMonitor(context.getPackageName() + ".MainActivity", null, false);
+                context.startActivity(new Intent().setClassName(context.getPackageName(), context.getPackageName() + ".MainActivity").addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
+                Activity activity = waitForMonitorWithTimeout(monitor, 30000);
+                require(activity != null, "Activity did not open");
+                testStagedUploads(activity, context);
+                result.putString("result", "PASS: PNG, SVG, PDF, text, video and audio staging; originals intact; no network upload");
+                finish(Activity.RESULT_OK, result); return;
+            }
+            if ("true".equals(arguments.getString("diagnoseAnimations"))) {
+                context.startActivity(new Intent().setClassName(context.getPackageName(), context.getPackageName() + ".MainActivity").addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
+                Thread.sleep(1500);
+                result.putFloat("runtimeAnimatorScale", android.animation.ValueAnimator.getDurationScale());
+                result.putString("storedAnimatorScale", android.provider.Settings.Global.getString(context.getContentResolver(), "animator_duration_scale"));
+                finish(Activity.RESULT_OK, result); return;
+            }
+            if ("true".equals(arguments.getString("diagnoseFolders"))) {
+                diagnoseFolders(context, result);
+                finish(Activity.RESULT_OK, result); return;
+            }
             if ("true".equals(arguments.getString("diagnoseUpdates"))) {
                 android.content.SharedPreferences prefs = context.getSharedPreferences("app-download", Context.MODE_PRIVATE);
                 long id = prefs.getLong("id", -1);
@@ -94,7 +123,7 @@ public class ReleaseSmokeInstrumentation extends Instrumentation {
                 finish(Activity.RESULT_OK, result); return;
             }
             require((context.getApplicationInfo().flags & ApplicationInfo.FLAG_DEBUGGABLE) == 0, "Expected non-debuggable package");
-            require("0.8.77".equals(context.getPackageManager().getPackageInfo(context.getPackageName(), 0).versionName), "Wrong version");
+            require(BuildConfig.VERSION_NAME.equals(context.getPackageManager().getPackageInfo(context.getPackageName(), 0).versionName), "Wrong version");
             if ("true".equals(arguments.getString("testAppDownload"))) {
                 startActivitySync(new Intent().setClassName(context.getPackageName(), context.getPackageName() + ".MainActivity").addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
                 waitForIdleSync();
@@ -181,7 +210,7 @@ public class ReleaseSmokeInstrumentation extends Instrumentation {
             require(bitmap.getWidth() == 64 && bitmap.getHeight() == 64, "SVG rendering failed");
             bitmap.recycle();
             Activity activity = startActivitySync(new Intent().setClassName(context.getPackageName(), context.getPackageName() + ".MainActivity").addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
-            if ("true".equals(arguments.getString("testFolderBack"))) Thread.sleep(1000); else waitForIdleSync();
+            if ("true".equals(arguments.getString("testFolderBack")) || "true".equals(arguments.getString("diagnoseFolders"))) Thread.sleep(1000); else waitForIdleSync();
             require(!activity.isFinishing(), "Activity failed to start");
             if ("true".equals(arguments.getString("testFolderBack"))) {
                 testFolderBack(activity);
@@ -216,6 +245,206 @@ public class ReleaseSmokeInstrumentation extends Instrumentation {
             if (error instanceof java.lang.reflect.InvocationTargetException && error.getCause() != null) error = error.getCause();
             result.putString("result", "FAIL: " + error.getClass().getSimpleName() + ": " + error.getMessage());
             finish(Activity.RESULT_CANCELED, result);
+        }
+    }
+
+    private void testStagedUploads(Activity activity, Context context) throws Exception {
+        File directory = new File(context.getCacheDir(), "external-files/upload-smoke-" + java.util.UUID.randomUUID());
+        require(directory.mkdirs(), "Cannot create private fixtures");
+        File external = new File(context.getExternalFilesDir("updates"), "upload-smoke");
+        try {
+            File png = new File(directory, "tiny.png");
+            var bitmap = android.graphics.Bitmap.createBitmap(4, 3, android.graphics.Bitmap.Config.ARGB_8888);
+            try (var output = new java.io.FileOutputStream(png)) { bitmap.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, output); }
+            bitmap.recycle();
+            Files.write(new File(directory, "tiny.svg").toPath(), "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"12\" height=\"24\"><rect width=\"12\" height=\"24\" fill=\"red\"/></svg>".getBytes(StandardCharsets.UTF_8));
+            Files.write(new File(directory, "note.txt").toPath(), "MAGLE upload check".getBytes(StandardCharsets.UTF_8));
+            var pdf = new android.graphics.pdf.PdfDocument();
+            try {
+                var page = pdf.startPage(new android.graphics.pdf.PdfDocument.PageInfo.Builder(120, 80, 1).create());
+                page.getCanvas().drawColor(android.graphics.Color.WHITE);
+                pdf.finishPage(page);
+                try (var output = new java.io.FileOutputStream(new File(directory, "tiny.pdf"))) { pdf.writeTo(output); }
+            } finally { pdf.close(); }
+            java.util.List<File> fixtures = new java.util.ArrayList<>(java.util.List.of(directory.listFiles()));
+            for (String name : new String[]{"sample-mp4.mp4", "sample-mp3.mp3"}) {
+                File source = new File(external, name);
+                require(source.isFile(), "Missing read-only media fixture: " + name);
+                File copy = new File(directory, name); Files.copy(source.toPath(), copy.toPath()); fixtures.add(copy);
+            }
+            for (File source : fixtures) {
+                File job = null;
+                try {
+                    var uri = androidx.core.content.FileProvider.getUriForFile(context, context.getPackageName() + ".files", source);
+                    job = (File) invoke(activity, "stageUpload", uri, java.util.Set.of(), java.util.List.of());
+                    require(hash(source).equals(hash(new File(job, "original"))), "Original changed: " + source.getName());
+                    JSONObject metadata = new JSONObject(new String(Files.readAllBytes(new File(job, "metadata.json").toPath()), StandardCharsets.UTF_8));
+                    boolean preview = new File(job, "thumbnail.png").isFile();
+                    require(metadata.getBoolean("noThumbnail") != preview, "Preview flag disagrees with actual file");
+                    if (source.getName().equals("note.txt")) require(!preview, "Text must use the extension fallback");
+                    if (source.getName().equals("tiny.svg")) require(metadata.getInt("width") == 12 && metadata.getInt("height") == 24, "Lost SVG original dimensions");
+                    if (source.getName().equals("tiny.png") || source.getName().equals("tiny.pdf") || source.getName().endsWith(".mp4")) require(preview, "Missing native preview: " + source.getName());
+                    Bundle status = new Bundle(); status.putString("staged", source.getName()); status.putBoolean("preview", preview); sendStatus(30, status);
+                } finally {
+                    if (job != null) {
+                        require(job.getParentFile().equals(new File(context.getNoBackupFilesDir(), "eagle-uploads")), "Unexpected staging path");
+                        for (File file : job.listFiles()) require(file.delete(), "Cannot clean generated stage");
+                        require(job.delete(), "Cannot clean generated stage directory");
+                    }
+                }
+            }
+        } finally {
+            for (File file : directory.listFiles()) file.delete(); directory.delete();
+        }
+    }
+
+    private Object state(Activity activity, String name, Object value, boolean write) throws Exception {
+        java.lang.reflect.Field field;
+        try { field = activity.getClass().getDeclaredField(name + "$delegate"); }
+        catch (NoSuchFieldException plain) {
+            field = activity.getClass().getDeclaredField(name); field.setAccessible(true);
+            Object old = field.get(activity); if (write) field.set(activity, value); return old;
+        }
+        field.setAccessible(true);
+        Object delegate = field.get(activity);
+        var get = delegate.getClass().getMethod("getValue"); get.setAccessible(true);
+        Object old = get.invoke(delegate);
+        if (write) { var set = delegate.getClass().getMethod("setValue", Object.class); set.setAccessible(true); set.invoke(delegate, value); }
+        return old;
+    }
+
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    private void testOptimisticCategory(Activity activity) throws Exception {
+        String[] names = {"source", "libraryLoaded", "libraryId", "webDavUrl", "folderTree", "selectedFolderIds", "selectedTags", "selectedTagGroupIds", "selectedSection", "selectedFolderId", "selectedTag", "selectedFolderName", "indexedAssets", "libraryTags", "tagGroups", "browseHistory", "browseKey", "nextBrowseKey", "searchQuery", "searchOpen", "categorySavePending", "batchBusy"};
+        java.util.Map<String, Object> saved = new java.util.LinkedHashMap<>();
+        for (String name : names) saved.put(name, state(activity, name, null, false));
+        var workField = activity.getClass().getDeclaredField("work"); workField.setAccessible(true);
+        var work = (java.util.concurrent.ExecutorService) workField.get(activity);
+        var barrier = new java.util.concurrent.CountDownLatch(1);
+        var released = new java.util.concurrent.CountDownLatch(1);
+        work.submit(() -> { barrier.countDown(); try { released.await(60, java.util.concurrent.TimeUnit.SECONDS); } catch (InterruptedException ignored) { Thread.currentThread().interrupt(); } });
+        require(barrier.await(90, java.util.concurrent.TimeUnit.SECONDS), "Startup worker did not settle");
+        Class<?> source = activity.getClassLoader().loadClass("com.tai.oeviewer.MainActivity$LibrarySource");
+        Class<?> section = activity.getClassLoader().loadClass("com.tai.oeviewer.LibrarySection");
+        Object folderSection = Enum.valueOf((Class)section, "FOLDER");
+        JSONObject fixture = new JSONObject("{\"folders\":[{\"id\":\"TEST-FOLDER\",\"name\":\"Original\",\"icon\":\"folder\",\"iconColor\":\"blue\",\"children\":[]}],\"tagsGroups\":[],\"tags\":[]}");
+        try {
+            runOnMainSync(() -> {
+                try {
+                    state(activity, "source", Enum.valueOf((Class)source, "WEBDAV"), true);
+                    state(activity, "webDavUrl", null, true); // Fail before any HTTP request.
+                    state(activity, "libraryLoaded", true, true);
+                    state(activity, "libraryId", "optimistic-ui-test", true);
+                    invoke(activity, "applyStructureMetadata", fixture);
+                    state(activity, "selectedSection", folderSection, true);
+                    state(activity, "selectedFolderId", "TEST-FOLDER", true);
+                    state(activity, "selectedFolderName", "Original", true);
+                    state(activity, "selectedFolderIds", java.util.Set.of("TEST-FOLDER"), true);
+                    invoke(activity, "saveCategoryEdit", "Edited", "yellow", "demon");
+                    JSONObject preview = (JSONObject)invoke(activity, "structureSnapshot");
+                    JSONObject node = preview.getJSONArray("folders").getJSONObject(0);
+                    require(node.getString("name").equals("Edited") && node.getString("iconColor").equals("yellow") && node.getString("icon").equals("demon"), "Preview was not immediate");
+                    require(((java.util.Set<?>)state(activity, "selectedFolderIds", null, false)).isEmpty(), "Selection remained locked");
+                } catch (Exception error) { throw new RuntimeException(error); }
+            });
+            Thread.sleep(500); // Allow Compose to install the back handler for the previewed folder.
+            runOnMainSync(activity::onBackPressed);
+            Thread.sleep(200);
+            runOnMainSync(() -> {
+                try {
+                    require(state(activity, "selectedFolderId", null, false) == null, "Back navigation blocked while saving");
+                    state(activity, "selectedFolderId", "TEST-FOLDER", true);
+                    state(activity, "selectedFolderName", "Edited", true);
+                } catch (Exception error) { throw new RuntimeException(error); }
+            });
+            released.countDown();
+            work.submit(() -> {}).get(15, java.util.concurrent.TimeUnit.SECONDS);
+            Thread.sleep(500);
+            runOnMainSync(() -> {
+                try {
+                    JSONObject reverted = (JSONObject)invoke(activity, "structureSnapshot");
+                    JSONObject node = reverted.getJSONArray("folders").getJSONObject(0);
+                    require(node.getString("name").equals("Original") && node.getString("iconColor").equals("blue") && node.getString("icon").equals("folder"), "Failure did not restore metadata");
+                    require(state(activity, "selectedFolderName", null, false).equals("Original"), "Failure did not restore current title");
+                } catch (Exception error) { throw new RuntimeException(error); }
+            });
+        } finally {
+            released.countDown();
+            runOnMainSync(() -> {
+                try { for (var entry : saved.entrySet()) state(activity, entry.getKey(), entry.getValue(), true); }
+                catch (Exception error) { throw new RuntimeException(error); }
+            });
+        }
+    }
+
+    private String folderSummary(JSONObject root) throws Exception {
+        org.json.JSONArray result = new org.json.JSONArray();
+        collectFolderSummary(root.optJSONArray("folders"), result);
+        return result.toString();
+    }
+
+    private void diagnoseFolders(Context context, Bundle result) throws Exception {
+        var prefs = context.getSharedPreferences("library", Context.MODE_PRIVATE);
+        String id = prefs.getString("libraryId", ""), drive = prefs.getString("driveId", "");
+        result.putString("source", prefs.getString("source", ""));
+        result.putString("library", prefs.getString("libraryName", ""));
+        File cache = new File(context.getFilesDir(), "eagle-folders-" + id.hashCode() + ".json");
+        if (cache.isFile()) result.putString("cachedFolders", folderSummary(new JSONObject(new String(Files.readAllBytes(cache.toPath()), StandardCharsets.UTF_8))));
+        sendStatus(20, result);
+        require("ONEDRIVE".equals(prefs.getString("source", "")), "Select OneDrive for this read-only diagnosis");
+        String clientId = "7d995065-a18c-4b0d-9b3a-0917e773dc62";
+        Class<?> store = context.getClassLoader().loadClass("com.tai.oeviewer.TokenStore");
+        var load = store.getDeclaredMethod("loadSecret", Context.class, String.class); load.setAccessible(true);
+        String refresh = (String) load.invoke(null, context, "onedrive-" + clientId);
+        require(refresh != null, "No saved account token");
+        result.putString("stage", "refreshing account"); sendStatus(21, result);
+        String body = "client_id=" + clientId + "&grant_type=refresh_token&scope=" + java.net.URLEncoder.encode("offline_access Files.ReadWrite User.Read", "UTF-8") + "&refresh_token=" + java.net.URLEncoder.encode(refresh, "UTF-8");
+        var auth = diagnosticConnection("https://login.microsoftonline.com/consumers/oauth2/v2.0/token");
+        auth.setConnectTimeout(15000); auth.setReadTimeout(15000); auth.setRequestMethod("POST"); auth.setDoOutput(true);
+        auth.setRequestProperty("Content-Type", "application/x-www-form-urlencoded");
+        JSONObject token;
+        try {
+            try (var out = auth.getOutputStream()) { out.write(body.getBytes(StandardCharsets.UTF_8)); }
+            require(auth.getResponseCode() == 200, "Token refresh HTTP " + auth.getResponseCode());
+            try (var in = auth.getInputStream()) { token = new JSONObject(new String(in.readAllBytes(), StandardCharsets.UTF_8)); }
+        } finally { auth.disconnect(); }
+        result.putString("stage", "reading cloud metadata"); sendStatus(22, result);
+        if (token.has("refresh_token")) {
+            var save = store.getDeclaredMethod("saveSecret", Context.class, String.class, String.class); save.setAccessible(true);
+            save.invoke(null, context, "onedrive-" + clientId, token.getString("refresh_token"));
+        }
+        String base = "https://graph.microsoft.com/v1.0/drives/" + drive + "/items/" + id;
+        result.putString("remoteFolders", folderSummary(readGraph(base + ":/metadata.json:/content", token.getString("access_token"))));
+        JSONObject item = readGraph(base + "?$select=name,parentReference", token.getString("access_token"));
+        result.putString("cloudPath", item.optJSONObject("parentReference").optString("path") + "/" + item.optString("name"));
+    }
+
+    private JSONObject readGraph(String url, String token) throws Exception {
+        var connection = diagnosticConnection(url);
+        connection.setConnectTimeout(15000); connection.setReadTimeout(15000);
+        connection.setInstanceFollowRedirects(false);
+        if (token != null) connection.setRequestProperty("Authorization", "Bearer " + token);
+        try {
+            int status = connection.getResponseCode();
+            if (status == 302 || status == 301 || status == 307) return readGraph(connection.getHeaderField("Location"), null);
+            require(status == 200, "Graph HTTP " + status);
+            try (var in = connection.getInputStream()) { return new JSONObject(new String(in.readAllBytes(), StandardCharsets.UTF_8)); }
+        } finally { connection.disconnect(); }
+    }
+
+    private java.net.HttpURLConnection diagnosticConnection(String url) throws Exception {
+        if ("true".equals(arguments.getString("usbProxy"))) return (java.net.HttpURLConnection) new java.net.URL(url).openConnection(new java.net.Proxy(java.net.Proxy.Type.HTTP, new java.net.InetSocketAddress("127.0.0.1", 17891)));
+        return (java.net.HttpURLConnection) new java.net.URL(url).openConnection();
+    }
+
+    private void collectFolderSummary(org.json.JSONArray folders, org.json.JSONArray result) throws Exception {
+        if (folders == null) return;
+        for (int i = 0; i < folders.length(); i++) {
+            JSONObject folder = folders.getJSONObject(i);
+            if (folder.optString("name").equals("TenW") || folder.optString("name").contains("概念设计")) {
+                result.put(new JSONObject().put("name", folder.optString("name")).put("icon", folder.optString("icon")).put("color", folder.optString("iconColor")));
+            }
+            collectFolderSummary(folder.optJSONArray("children"), result);
         }
     }
 

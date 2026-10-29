@@ -14,8 +14,8 @@ android {
         applicationId = "com.tai.oeviewer"
         minSdk = 29
         targetSdk = 36
-        versionCode = 101
-        versionName = "0.8.77"
+        versionCode = 117
+        versionName = "0.8.93"
         testInstrumentationRunner = "com.tai.oeviewer.ReleaseSmokeInstrumentation"
         // MAGLE's public client registration; existing OE Link tokens remain isolated.
         val oneDriveId = providers.gradleProperty("magleOneDriveClientId")
@@ -51,6 +51,7 @@ dependencies {
     implementation(composeBom)
     implementation("androidx.activity:activity-compose:1.12.3")
     implementation("androidx.compose.material3:material3")
+    implementation("com.google.android.material:material:1.14.0") // Google's HCT / Material color scheme generator.
     implementation("androidx.compose.material:material-icons-core")
     implementation("androidx.documentfile:documentfile:1.0.0")
     implementation("com.caverock:androidsvg-aar:1.4")

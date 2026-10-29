@@ -6,6 +6,32 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class LibraryWritesTest {
+    @Test fun syncedCopyIdsWorkInBatchEditsWithoutAllowingPaths() {
+        val state = JSONObject().put("source", "LOCAL").put("libraryId", "test-library")
+            .put("old", "old").put("name", "new")
+            .put("ids", JSONArray(listOf("MKIFXUOKFRRU7(1)"))).put("done", JSONArray())
+        val task = TagRenameTask(state)
+        task.complete("MKIFXUOKFRRU7(1)")
+        assertEquals(setOf("MKIFXUOKFRRU7(1)"), TagRenameTask(JSONObject(task.json.toString())).done)
+        for (id in listOf("../item", "a/b", "a\\b", ".", "", "a".repeat(129))) {
+            assertFalse(LibraryLogic.validAssetId(id))
+            assertTrue(runCatching { TagRenameTask(JSONObject(state.toString()).put("ids", JSONArray(listOf(id)))) }.isFailure)
+        }
+    }
+    @Test fun folderDeletionKeepsDurableScopeAndRecycleChoice() {
+        val task = TagRenameTask(JSONObject().put("source", "LOCAL").put("libraryId", "test-library")
+            .put("old", "文件夹").put("name", "").put("deleteFolders", JSONArray("""[{"id":"P","children":[{"id":"C"}]}]"""))
+            .put("recycleFolderAssets", true).put("ids", JSONArray(listOf("a", "b"))).put("done", JSONArray()))
+        task.complete("a")
+        val resumed = TagRenameTask(JSONObject(task.json.toString()))
+        assertTrue(resumed.deletingFolders)
+        assertFalse(resumed.deleting)
+        assertTrue(resumed.recycleFolderAssets)
+        assertEquals(setOf("P", "C"), resumed.deletedFolderIds)
+        assertEquals(setOf("a"), resumed.done)
+        assertFalse(resumed.matches("LOCAL", "different-library", null))
+    }
+
     @Test fun batchTagDeletionIsResumableAndPreservesFilesGroupsAndOtherTags() {
         val task = TagRenameTask(JSONObject().put("source", "LOCAL").put("libraryId", "test-library")
             .put("old", "A").put("name", "").put("deleteTags", JSONArray(listOf("A", "B")))

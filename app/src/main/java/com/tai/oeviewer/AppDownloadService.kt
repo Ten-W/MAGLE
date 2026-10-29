@@ -90,13 +90,22 @@ internal fun downloadAppFile(client: OkHttpClient, release: AppRelease, target: 
     }
     check(partial.length() == release.size) { "安装包尚未下载完整" }
     if (release.digest.isNotBlank()) {
-        val hash = java.security.MessageDigest.getInstance("SHA-256")
-        partial.inputStream().use { input -> val buffer = ByteArray(65536); while (true) {
-            val size = input.read(buffer); if (size < 0) break; hash.update(buffer, 0, size)
-        } }
-        if ("sha256:" + hash.digest().joinToString("") { "%02x".format(it) } != release.digest) {
+        if (appFileDigest(partial) != release.digest) {
             partial.delete(); error("安装包校验失败，请重新下载")
         }
     }
     check(partial.renameTo(target)) { "无法保存安装包" }
+}
+
+internal fun appFileDigest(file: File): String {
+    val hash = java.security.MessageDigest.getInstance("SHA-256")
+    file.inputStream().use { input ->
+        val buffer = ByteArray(65536)
+        while (true) {
+            val size = input.read(buffer)
+            if (size < 0) break
+            hash.update(buffer, 0, size)
+        }
+    }
+    return "sha256:" + hash.digest().joinToString("") { "%02x".format(it) }
 }

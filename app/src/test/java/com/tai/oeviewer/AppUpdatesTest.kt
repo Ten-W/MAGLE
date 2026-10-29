@@ -32,7 +32,7 @@ class AppUpdatesTest {
         assertFalse(source.contains("appUpdateOnOpen"))
         val startup = source.substringAfter("override fun onCreate").substringBefore("override fun onStart")
         assertFalse(startup.contains("checkAppUpdate"))
-        val layout = source.substringAfter("private fun SettingsScreen()").substringBefore("private fun SettingsAbout()")
+        val layout = source.substringAfter("private fun SettingsScreen(").substringBefore("private fun SettingsAbout()")
         assertEquals(2, Regex("SettingsAbout\\(\\)").findAll(layout).count())
     }
     @Test fun onlyNewerDownloadableVersionsFromExpectedRepository() {

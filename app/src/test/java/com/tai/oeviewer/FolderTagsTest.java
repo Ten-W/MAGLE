@@ -8,6 +8,62 @@ import java.util.Set;
 import static org.junit.Assert.*;
 
 public class FolderTagsTest {
+    @Test public void deletingFoldersPreservesOtherMembershipAndNeverDeletesFiles() throws Exception {
+        JSONObject metadata = new JSONObject("{\"folders\":[{\"id\":\"P\",\"name\":\"Parent\",\"children\":[{\"id\":\"C\",\"name\":\"Child\"}]},{\"id\":\"Other\",\"name\":\"Keep\"}]}");
+        JSONArray snapshot = LibraryLogic.folderDeletionSnapshot(metadata, Set.of("P", "C"));
+        assertEquals(1, snapshot.length());
+        assertEquals(Set.of("P", "C"), LibraryLogic.folderIds(snapshot));
+        JSONObject asset = new JSONObject("{\"name\":\"image\",\"folders\":[\"C\",\"Other\"],\"tags\":[\"Tag\"],\"isDeleted\":false}");
+        LibraryLogic.removeFolderReferences(asset, LibraryLogic.folderIds(snapshot), false);
+        assertEquals("Other", asset.getJSONArray("folders").getString(0));
+        assertEquals("Tag", asset.getJSONArray("tags").getString(0));
+        assertFalse(asset.getBoolean("isDeleted"));
+        LibraryLogic.removeFolders(metadata, snapshot);
+        assertNull(LibraryLogic.findFolder(metadata.getJSONArray("folders"), "C"));
+        assertNotNull(LibraryLogic.findFolder(metadata.getJSONArray("folders"), "Other"));
+        LibraryLogic.removeFolders(metadata, snapshot); // Lost successful response can replay.
+        JSONObject recycled = new JSONObject("{\"folders\":[\"C\",\"Other\"],\"name\":\"original\"}");
+        LibraryLogic.removeFolderReferences(recycled, Set.of("C"), true);
+        assertTrue(recycled.getBoolean("isDeleted"));
+        assertEquals("original", recycled.getString("name"));
+        assertEquals("Other", recycled.getJSONArray("folders").getString(0));
+        JSONObject unfiled = new JSONObject("{\"folders\":[\"C\"]}");
+        LibraryLogic.removeFolderReferences(unfiled, Set.of("C"), false);
+        assertEquals(0, unfiled.getJSONArray("folders").length());
+    }
+
+    @Test public void folderDeleteDoesNotDropNewOrMovedChildren() throws Exception {
+        JSONObject metadata = new JSONObject("{\"folders\":[{\"id\":\"P\",\"children\":[{\"id\":\"C\"}]}]}");
+        JSONArray snapshot = LibraryLogic.folderDeletionSnapshot(metadata, Set.of("P"));
+        metadata.getJSONArray("folders").getJSONObject(0).getJSONArray("children").put(new JSONObject().put("id", "New"));
+        try { LibraryLogic.removeFolders(metadata, snapshot); fail(); } catch (IllegalArgumentException expected) { }
+        assertNotNull(LibraryLogic.findFolder(metadata.getJSONArray("folders"), "New"));
+        JSONObject moved = new JSONObject("{\"folders\":[{\"id\":\"C\"}]}");
+        try { LibraryLogic.removeFolders(moved, snapshot); fail(); } catch (IllegalArgumentException expected) { }
+        assertNotNull(LibraryLogic.findFolder(moved.getJSONArray("folders"), "C"));
+    }
+
+    @Test public void colorsAndTagMovesOnlyChangeRequestedMetadata() throws Exception {
+        JSONObject metadata = new JSONObject("{\"folders\":[{\"id\":\"F\",\"name\":\"Keep\",\"icon\":\"custom\",\"children\":[]}],\"tagsGroups\":[{\"id\":\"A\",\"name\":\"One\",\"tags\":[\"X\",\"Keep\"]},{\"id\":\"B\",\"tags\":[\"Y\"]}]}");
+        LibraryLogic.setFolderColors(metadata, Set.of("F"), "aqua");
+        assertEquals("aqua", metadata.getJSONArray("folders").getJSONObject(0).getString("iconColor"));
+        assertEquals("custom", metadata.getJSONArray("folders").getJSONObject(0).getString("icon"));
+        LibraryLogic.setTagGroupColors(metadata, Set.of("A"), "red");
+        LibraryLogic.moveTags(metadata, Set.of("X"), "B");
+        assertEquals("Keep", metadata.getJSONArray("tagsGroups").getJSONObject(0).getJSONArray("tags").getString(0));
+        assertEquals("red", metadata.getJSONArray("tagsGroups").getJSONObject(0).getString("color"));
+        assertEquals(2, metadata.getJSONArray("tagsGroups").getJSONObject(1).getJSONArray("tags").length());
+        LibraryLogic.moveTags(metadata, Set.of("X"), "B");
+        assertEquals(2, metadata.getJSONArray("tagsGroups").getJSONObject(1).getJSONArray("tags").length());
+        LibraryLogic.moveTags(metadata, Set.of("X"), null);
+        assertEquals(1, metadata.getJSONArray("tagsGroups").getJSONObject(1).getJSONArray("tags").length());
+        String before = metadata.toString();
+        try { LibraryLogic.moveTags(metadata, Set.of("Keep"), "missing"); fail(); } catch (IllegalArgumentException expected) { }
+        assertEquals(before, metadata.toString());
+        try { LibraryLogic.setFolderColors(metadata, Set.of("F"), "invalid"); fail(); } catch (IllegalArgumentException expected) { }
+        assertEquals(before, metadata.toString());
+    }
+
     @Test public void folderCountsUnionDescendantsWithoutCountingSameAssetTwice() {
         java.util.Map<String, Set<String>> items = java.util.Map.of("parent", Set.of("A", "B"), "child", Set.of("B", "C"));
         assertEquals(3, LibraryLogic.folderAssetCount(items, List.of("parent", "child", "missing")));
@@ -44,6 +100,19 @@ public class FolderTagsTest {
         assertEquals("Keep", group.getJSONArray("tags").getString(1));
         assertEquals("Group", group.getString("name"));
         assertEquals("blue", group.getString("color"));
+    }
+
+    @Test public void folderIconsUseEagleMetadataAndPreflightBeforeChangingAnyFolder() throws Exception {
+        JSONObject folder = new JSONObject().put("id", "F").put("name", "TenW").put("iconColor", "blue").put("children", new JSONArray());
+        JSONObject metadata = new JSONObject().put("folders", new JSONArray().put(folder));
+        LibraryLogic.setFolderIcons(metadata, Set.of("F"), "demon");
+        assertEquals("demon", new JSONObject(metadata.toString()).getJSONArray("folders").getJSONObject(0).getString("icon"));
+        assertEquals("blue", folder.getString("iconColor"));
+        try { LibraryLogic.setFolderIcons(metadata, Set.of("F", "missing"), "star"); fail(); }
+        catch (IllegalArgumentException expected) { }
+        assertEquals("demon", folder.getString("icon"));
+        LibraryLogic.setFolderIcons(metadata, Set.of("F"), "");
+        assertFalse(folder.has("icon"));
     }
 
     @Test public void directAndDescendantFiltersAndEagleGroups() throws Exception {

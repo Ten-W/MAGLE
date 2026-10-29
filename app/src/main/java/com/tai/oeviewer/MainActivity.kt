@@ -11,7 +11,6 @@ import android.content.Intent
 import android.accounts.Account
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
-import android.graphics.ImageDecoder
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -25,6 +24,11 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.expandVertically
+import androidx.compose.animation.shrinkVertically
+import androidx.compose.runtime.SideEffect
+import androidx.core.view.WindowCompat
 import androidx.compose.animation.togetherWith
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.result.IntentSenderRequest
@@ -104,13 +108,13 @@ import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.updateTransition
+import androidx.compose.animation.core.animateDp
+import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.foundation.layout.requiredSize
 import androidx.compose.animation.animateContentSize
-import androidx.compose.animation.expandIn
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
-import androidx.compose.animation.shrinkOut
-import androidx.compose.animation.core.MutableTransitionState
 import androidx.compose.animation.core.tween
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
@@ -132,6 +136,9 @@ import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.BottomAppBarDefaults
+import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.material3.ElevatedCard
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilledTonalButton
@@ -199,6 +206,9 @@ import androidx.compose.ui.semantics.disabled
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.changedToUp
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.platform.LocalLayoutDirection
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.draw.clip
@@ -206,12 +216,7 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.platform.LocalFocusManager
-import androidx.compose.ui.platform.LocalWindowInfo
-import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.layout.onSizeChanged
-import androidx.compose.ui.unit.IntSize
-import androidx.compose.ui.window.Popup
-import androidx.compose.ui.window.PopupProperties
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.contentDescription
@@ -222,7 +227,6 @@ import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import androidx.compose.ui.window.DialogWindowProvider
 import androidx.compose.ui.platform.LocalView
-import androidx.compose.runtime.SideEffect
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.coroutineScope
@@ -276,6 +280,7 @@ class MainActivity : ComponentActivity() {
     @Volatile private var galleryScrolling = false
     @Volatile private var pauseIndexForEdit = false
     private var tagRenameStatus by mutableStateOf("")
+    private var categorySavePending by mutableStateOf(false)
     private var attemptedTagResume = false
 
     private fun queueEdit(action: () -> Unit) {
@@ -368,6 +373,9 @@ class MainActivity : ComponentActivity() {
     private var directoryMenuOpen by mutableStateOf(false)
     private var expandedFolderIds by mutableStateOf<Set<String>>(emptySet())
     private var folderGroupOpen by mutableStateOf(false)
+    private var directoryPinned by mutableStateOf(false)
+    private var directoryHeader by mutableStateOf("")
+    private var directoryPull: () -> Float = { 0f }
     private var tagManagerOpen by mutableStateOf(false)
     private var selectedTag by mutableStateOf<String?>(null)
     private var browseHistory by mutableStateOf<List<BrowseLocation>>(emptyList())
@@ -398,6 +406,11 @@ class MainActivity : ComponentActivity() {
     private var deleteTagsCandidate by mutableStateOf<Set<String>>(emptySet())
     private var renameFolderOpen by mutableStateOf(false)
     private var moveFoldersOpen by mutableStateOf(false)
+    private var moveTagsOpen by mutableStateOf(false)
+    private var deleteFoldersCandidate by mutableStateOf<Set<String>>(emptySet())
+    private var themeMode by mutableIntStateOf(0) // 0 system, 1 dark, 2 light
+    private var themeColor by mutableStateOf("wallpaper")
+    private var accentColor by mutableStateOf("wallpaper")
     private var detailAssets = emptyList<AssetMeta>()
     private var selectionAssets by mutableStateOf<List<AssetMeta>>(emptyList())
     private var batchBusy by mutableStateOf(false)
@@ -441,7 +454,7 @@ class MainActivity : ComponentActivity() {
     }
     private val cachedTagGroups by derivedStateOf {
         val assigned = tagGroups.flatMap { group -> group.getJSONArray("tags").let { array -> (0 until array.length()).map { array.getString(it) } } }.toSet()
-        val ungrouped = browseStatistics.tags.keys.sorted().filterNot { it in assigned }
+        val ungrouped = (browseStatistics.tags.keys + libraryTags).distinct().sorted().filterNot { it in assigned }
         tagGroups + if (ungrouped.isEmpty()) emptyList() else listOf(JSONObject().put("id", "magle:ungrouped").put("name", "未分组").put("tags", JSONArray(ungrouped)))
     }
 
@@ -495,6 +508,8 @@ class MainActivity : ComponentActivity() {
             }
         }
     }
+    private var newCategory by mutableStateOf<Boolean?>(null)
+    private var libraryTags by mutableStateOf<List<String>>(emptyList())
     private var uploadCandidates by mutableStateOf<List<Uri>>(emptyList())
     private var uploadMessage by mutableStateOf("")
     private var pendingUploadCount by mutableIntStateOf(0)
@@ -510,6 +525,10 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         appRelease = appDownload.savedRelease()
         val viewerPrefs = getSharedPreferences("viewer", MODE_PRIVATE)
+        directoryPinned = viewerPrefs.getBoolean("directoryPinned", false)
+        themeMode = viewerPrefs.getInt("themeMode", 0).coerceIn(0, 2)
+        themeColor = viewerPrefs.getString("themeColor", "wallpaper").orEmpty().takeIf(AppColors::valid) ?: "wallpaper"
+        accentColor = viewerPrefs.getString("accentColor", themeColor.takeUnless { it == "black" } ?: "wallpaper").orEmpty().takeIf(AppColors::valid) ?: "wallpaper"
         viewMode = runCatching { AssetViewMode.valueOf(viewerPrefs.getString("mode", "WATERFALL")!!) }.getOrDefault(AssetViewMode.WATERFALL)
         gridCellSize = LibraryLogic.resizeCell(viewerPrefs.getFloat("gridSize", 112f), 1f, 32f, 2048f)
         waterfallCellSize = LibraryLogic.resizeCell(viewerPrefs.getFloat("waterfallSize", 140f), 1f, 32f, 2048f)
@@ -520,6 +539,7 @@ class MainActivity : ComponentActivity() {
         thumbnailCacheLimitEnabled = viewerPrefs.getBoolean("cacheLimitEnabled", true)
         indexWorkers.execute { trimThumbnailCache() }
         enableEdgeToEdge()
+        window.isNavigationBarContrastEnforced = false
         ensureWritePermissionMigration()
         loadSavedLibrary()
         val syncPrefs = getSharedPreferences("index-sync", MODE_PRIVATE)
@@ -555,7 +575,9 @@ class MainActivity : ComponentActivity() {
     private fun saveViewerPreferences() {
         getSharedPreferences("viewer", MODE_PRIVATE).edit().putString("mode", viewMode.name)
             .putFloat("gridSize", gridCellSize).putFloat("waterfallSize", waterfallCellSize)
-            .putFloat("listHeight", listRowHeight).putFloat("folderScale", folderScale).apply()
+            .putFloat("listHeight", listRowHeight).putFloat("folderScale", folderScale)
+            .putInt("themeMode", themeMode).putString("themeColor", themeColor).putString("accentColor", accentColor)
+            .putBoolean("directoryPinned", directoryPinned).apply()
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -582,10 +604,10 @@ class MainActivity : ComponentActivity() {
             return
         }
         uploadCandidates = images
-        settingsOpen = source != LibrarySource.ONEDRIVE || !connected || !libraryLoaded
+        settingsOpen = !canUpload()
         if (settingsOpen) {
             refreshSettings()
-            Toast.makeText(this, "图片已接收，请先连接并选择 OneDrive 素材库", Toast.LENGTH_LONG).show()
+            Toast.makeText(this, "图片已接收，请先连接并选择可写素材库", Toast.LENGTH_LONG).show()
         }
     }
 
@@ -608,12 +630,19 @@ class MainActivity : ComponentActivity() {
 
     @Composable
     private fun AEagleTheme(content: @Composable () -> Unit) {
-        val dark = androidx.compose.foundation.isSystemInDarkTheme()
-        val colors = when {
+        val dark = when (themeMode) { 1 -> true; 2 -> false; else -> androidx.compose.foundation.isSystemInDarkTheme() }
+        val base = when {
             Build.VERSION.SDK_INT >= 31 && dark -> dynamicDarkColorScheme(this)
             Build.VERSION.SDK_INT >= 31 -> dynamicLightColorScheme(this)
             dark -> darkColorScheme()
             else -> lightColorScheme()
+        }
+        val colors = remember(base, dark, themeColor, accentColor) { AppColors.scheme(base, dark, themeColor, accentColor) }
+        SideEffect {
+            WindowCompat.getInsetsController(window, window.decorView).apply {
+                isAppearanceLightStatusBars = !dark
+                isAppearanceLightNavigationBars = !dark
+            }
         }
         MaterialTheme(colorScheme = colors, content = content)
     }
@@ -624,14 +653,21 @@ class MainActivity : ComponentActivity() {
         val appPager = rememberPagerState(initialPage = if (settingsOpen) 1 else 0, pageCount = { 2 })
         LaunchedEffect(settingsOpen) {
             val target = if (settingsOpen) 1 else 0
-            if (appPager.currentPage != target) appPager.animateScrollToPage(target)
+            if (appPager.currentPage != target || appPager.currentPageOffsetFraction != 0f)
+                appPager.animateScrollToPage(target, animationSpec = tween(300))
         }
         LaunchedEffect(appPager) {
-            snapshotFlow { appPager.settledPage }.collect { page ->
-                if (page == 1 && !settingsOpen) openSettings()
-                else if (page == 0 && settingsOpen && !appPager.isScrollInProgress) settingsOpen = false
+            snapshotFlow { appPager.settledPage to appPager.isScrollInProgress }.collect { (page, moving) ->
+                if (!moving) {
+                    if (page == 1 && !settingsOpen) openSettings()
+                    else if (page == 0 && settingsOpen) closeSettings()
+                }
             }
         }
+        val accessibility = getSystemService(android.view.accessibility.AccessibilityManager::class.java)
+        val bottomScroll = BottomAppBarDefaults.exitAlwaysScrollBehavior(
+            canScroll = { !accessibility.isTouchExplorationEnabled && !appPager.isScrollInProgress && infoAsset == null && !hasSelection() && !directoryMenuOpen })
+        LaunchedEffect(settingsOpen, browseKey, hasSelection()) { bottomScroll.state.heightOffset = 0f; bottomScroll.state.contentOffset = 0f }
         LaunchedEffect(foreground, updateIntervalEnabled, updateIntervalMinutes, libraryId, connected, libraryLoaded) {
             if (foreground && updateIntervalEnabled && updateIntervalMinutes > 0) {
                 while (isActive) {
@@ -675,9 +711,9 @@ class MainActivity : ComponentActivity() {
                             }
                             BackHandler(enabled = infoAsset == null && (transientOpen || hasParent || !exitArmed)) {
                                 when {
-                                    settingsOpen -> { settingsOpen = false; searchOpen = searchQuery.isNotBlank() }
+                                    settingsOpen -> closeSettings()
                                     directoryMenuOpen -> directoryMenuOpen = false
-                                    hasSelection() -> if (!batchBusy) clearSelection()
+                                    hasSelection() -> if (!batchBusy || categorySavePending) clearSelection()
                                     viewPickerOpen -> viewPickerOpen = false
                                     searchOpen || searchQuery.isNotBlank() -> { searchOpen = false; searchQuery = "" }
                                     hasParent -> parentBrowse()?.let(::returnToParent)
@@ -688,11 +724,14 @@ class MainActivity : ComponentActivity() {
                                 }
                             }
                             HorizontalPager(state = appPager, beyondViewportPageCount = 1,
-                                userScrollEnabled = !batchBusy && !searchOpen && !directoryMenuOpen && infoAsset == null && !hasSelection(),
+                                userScrollEnabled = (!batchBusy || categorySavePending) && !searchOpen && !directoryMenuOpen && infoAsset == null && !hasSelection(),
                                 modifier = Modifier.fillMaxSize()) { page ->
                                 if (page == 0) {
-                                    Box(Modifier.fillMaxSize()) {
-                                        Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
+                                    BoxWithConstraints(Modifier.fillMaxSize()) {
+                                        val wide = with(LocalDensity.current) { LibraryLogic.usesSideInspector(LocalWindowInfo.current.containerSize.width.toDp().value) }
+                                        val pinned = wide && directoryPinned && libraryLoaded
+                                        val directoryInset by animateDpAsState(if (pinned) minOf(320.dp, maxWidth - 24.dp) + 24.dp else 0.dp, tween(220), label = "directory-content-inset")
+                                        Box(Modifier.fillMaxSize().padding(start = directoryInset).background(MaterialTheme.colorScheme.background).nestedScroll(bottomScroll.nestedScrollConnection)) {
                                             AnimatedContent(targetState = currentBrowse(), contentKey = { it.key },
                                                 modifier = Modifier.fillMaxSize(), label = "browse-content",
                                                 transitionSpec = {
@@ -700,24 +739,33 @@ class MainActivity : ComponentActivity() {
                                                     (fadeIn(tween(220, delayMillis = 90)) + androidx.compose.animation.scaleIn(tween(220, delayMillis = 90), initialScale = .92f)) togetherWith fadeOut(tween(90))
                                                 }) { location -> ViewerScreen(savedViews, location) }
                                         }
+                                        if (directoryMenuOpen && !pinned) Box(Modifier.fillMaxSize().pointerInput(Unit) {
+                                            detectTapGestures { directoryMenuOpen = false }
+                                        })
+                                        DirectoryPanel(pinned, wide)
                                     }
-                                } else SettingsScreen()
+                                } else SettingsScreen(Modifier.nestedScroll(bottomScroll.nestedScrollConnection))
                             }
                         }
                     }
                 }
             }
-            Box(Modifier.align(Alignment.BottomCenter).navigationBarsPadding().padding(bottom = 8.dp)) {
-                AppNavigationBar((appPager.currentPage + appPager.currentPageOffsetFraction).coerceIn(0f, 1f))
+            Box(Modifier.align(Alignment.BottomCenter)
+                .offset { androidx.compose.ui.unit.IntOffset(0, -bottomScroll.state.heightOffset.toInt()) }
+                .onSizeChanged { bottomScroll.state.heightOffsetLimit = -it.height.toFloat() }
+                .navigationBarsPadding().padding(bottom = 8.dp)) {
+                AppNavigationBar(appPager)
             }
         }
 
         devicePrompt?.let { LoginDialog(it) }
         if (pickerOpen) LibraryPickerDialog()
         infoAsset?.let { AssetInfoSheet(it) }
-        if (renameTagOpen) NameDialog(if (selectedTags.isNotEmpty()) "重命名标签" else "重命名标签组",
+        if (renameTagOpen) EditSelectionDialog(if (selectedTags.isNotEmpty()) "编辑标签" else "编辑标签组",
             selectedTags.singleOrNull() ?: tagGroups.firstOrNull { it.getString("id") in selectedTagGroupIds }?.getString("name").orEmpty(),
-            { renameTagOpen = false }) { name -> renameTagOpen = false; renameTagSelection(name) }
+            selectedTags.size + selectedTagGroupIds.size == 1 && "magle:ungrouped" !in selectedTagGroupIds,
+            isFolder = false, hasColor = selectedTagGroupIds.isNotEmpty() && "magle:ungrouped" !in selectedTagGroupIds,
+            onDismiss = { renameTagOpen = false }) { name, color, _ -> renameTagOpen = false; saveCategoryEdit(name, color, null) }
         if (deleteTagsCandidate.isNotEmpty()) AlertDialog(
             onDismissRequest = { deleteTagsCandidate = emptySet() },
             title = { Text("删除 ${deleteTagsCandidate.size} 个标签？") },
@@ -729,11 +777,14 @@ class MainActivity : ComponentActivity() {
             }, enabled = !batchBusy && canUpload()) { Text("删除标签") } },
             dismissButton = { TextButton(onClick = { deleteTagsCandidate = emptySet() }) { Text("取消") } }
         )
-        if (renameFolderOpen) NameDialog("重命名文件夹", flatFolderTree.firstOrNull { it.id in selectedFolderIds }?.name.orEmpty(),
-            { renameFolderOpen = false }) { name -> renameFolderOpen = false; changeFolders(name = name) }
-        if (moveFoldersOpen) FolderPicker(emptySet(), false, { moveFoldersOpen = false }, rootLabel = "库根目录") { target ->
+        if (renameFolderOpen) EditSelectionDialog("编辑文件夹", flatFolderTree.firstOrNull { it.id in selectedFolderIds }?.name.orEmpty(), selectedFolderIds.size == 1,
+            isFolder = true, hasColor = true, onDismiss = { renameFolderOpen = false }) { name, color, icon -> renameFolderOpen = false; saveCategoryEdit(name, color, icon) }
+        if (moveFoldersOpen) FolderPicker(emptySet(), false, { moveFoldersOpen = false }, rootLabel = "库根目录",
+            excluded = flatFolderTree.filter { it.id in selectedFolderIds }.flatMap { allFolders(listOf(it)) }.map { it.id }.toSet()) { target ->
             moveFoldersOpen = false; changeFolders(parentId = target.firstOrNull())
         }
+        if (moveTagsOpen) TagGroupPickerDialog()
+        if (deleteFoldersCandidate.isNotEmpty()) DeleteFoldersDialog()
         if (trashCandidate.isNotEmpty()) TrashConfirmation(trashCandidate)
         if (moveCandidate.isNotEmpty()) MoveFolderDialog(moveCandidate)
         if (tagCandidate.isNotEmpty()) TagPicker(emptyList(), { tagCandidate = emptyList() }) { tags ->
@@ -749,34 +800,37 @@ class MainActivity : ComponentActivity() {
         if (webDavDialogOpen) WebDavDialog()
         remoteChooser?.let { RemoteSourceDialog(it) }
         if (uploadCandidates.isNotEmpty() && canUpload()) UploadConfirmation()
+        newCategory?.let { NewCategoryDialog(it) }
     }
 
     @Composable
-    private fun AppNavigationBar(progress: Float) {
+    private fun AppNavigationBar(pager: androidx.compose.foundation.pager.PagerState) {
+        val density = LocalDensity.current
         Surface(shape = CircleShape, shadowElevation = 6.dp, color = MaterialTheme.colorScheme.surfaceContainerHigh) {
             Box(Modifier.width(208.dp).height(64.dp).padding(4.dp)) {
-            Surface(Modifier.offset(x = (100f * progress).dp).width(100.dp).height(56.dp),
-                shape = CircleShape, color = MaterialTheme.colorScheme.secondaryContainer) {}
-            Row(Modifier.fillMaxSize()) {
-                Surface(onClick = { settingsOpen = false; searchOpen = false },
-                    modifier = Modifier.weight(1f).height(56.dp).semantics { selected = !settingsOpen },
-                    shape = CircleShape,
-                    color = androidx.compose.ui.graphics.Color.Transparent) {
-                    Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(2.dp, Alignment.CenterVertically)) {
-                        Icon(painterResource(R.drawable.ic_image_24), null, Modifier.size(22.dp))
-                        Text("视图", style = MaterialTheme.typography.labelMedium)
+                Surface(Modifier.offset {
+                    val progress = (pager.currentPage + pager.currentPageOffsetFraction).coerceIn(0f, 1f)
+                    androidx.compose.ui.unit.IntOffset(with(density) { (100.dp * progress).roundToPx() }, 0)
+                }.width(100.dp).height(56.dp),
+                    shape = CircleShape, color = MaterialTheme.colorScheme.secondaryContainer) {}
+                Row(Modifier.fillMaxSize()) {
+                    Surface(onClick = ::closeSettings,
+                        modifier = Modifier.weight(1f).height(56.dp).semantics { selected = !settingsOpen },
+                        shape = CircleShape, color = androidx.compose.ui.graphics.Color.Transparent) {
+                        Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(2.dp, Alignment.CenterVertically)) {
+                            Icon(painterResource(R.drawable.ic_image_24), null, Modifier.size(22.dp))
+                            Text("视图", style = MaterialTheme.typography.labelMedium)
+                        }
+                    }
+                    Surface(onClick = ::openSettings,
+                        modifier = Modifier.weight(1f).height(56.dp).semantics { selected = settingsOpen },
+                        shape = CircleShape, color = androidx.compose.ui.graphics.Color.Transparent) {
+                        Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(2.dp, Alignment.CenterVertically)) {
+                            Icon(Icons.Default.Settings, null, Modifier.size(22.dp))
+                            Text("设置", style = MaterialTheme.typography.labelMedium)
+                        }
                     }
                 }
-                Surface(onClick = ::openSettings,
-                    modifier = Modifier.weight(1f).height(56.dp).semantics { selected = settingsOpen },
-                    shape = CircleShape,
-                    color = androidx.compose.ui.graphics.Color.Transparent) {
-                    Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(2.dp, Alignment.CenterVertically)) {
-                        Icon(Icons.Default.Settings, null, Modifier.size(22.dp))
-                        Text("设置", style = MaterialTheme.typography.labelMedium)
-                    }
-                }
-            }
             }
         }
     }
@@ -809,7 +863,7 @@ class MainActivity : ComponentActivity() {
         } }
         val query = searchQuery.trim()
         val searchFolders = remember(folderTree, query) { flatFolderTree.filter { query.isNotBlank() && it.name.contains(query, true) } }
-        val searchTags = remember(indexedAssets, tagGroups, query) { availableTagGroups().flatMap { group ->
+        val searchTags = remember(indexedAssets, tagGroups, libraryTags, query) { availableTagGroups().flatMap { group ->
             val tags = group.getJSONArray("tags")
             (0 until tags.length()).map { tags.getString(it) }
         }.distinct().filter { query.isNotBlank() && it.contains(query, true) }.sortedBy { it.lowercase() } }
@@ -872,7 +926,7 @@ class MainActivity : ComponentActivity() {
     @Composable
     private fun SelectionLabel(count: Int, kind: String, modifier: Modifier) {
         Box(modifier) {
-            Surface(onClick = ::clearSelection, enabled = !batchBusy, shape = CircleShape,
+            Surface(onClick = ::clearSelection, enabled = !batchBusy || categorySavePending, shape = CircleShape,
                 modifier = Modifier.height(48.dp).padding(vertical = 4.dp).widthIn(max = 280.dp), shadowElevation = 0.dp,
                 color = MaterialTheme.colorScheme.surfaceContainerHigh) {
                 Row(Modifier.padding(horizontal = 12.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -897,7 +951,7 @@ class MainActivity : ComponentActivity() {
         val selectedSection = location.section
         val selectedTag = location.tag
         val selectedFolderName = location.name
-        val groups = remember(tagGroups, indexedAssets) { availableTagGroups() }
+        val groups = remember(tagGroups, indexedAssets, libraryTags) { availableTagGroups() }
         val counts = browseStatistics.sections
         val keyboard = LocalSoftwareKeyboardController.current
         LaunchedEffect(searchOpen) { if (!searchOpen) keyboard?.hide() }
@@ -906,7 +960,7 @@ class MainActivity : ComponentActivity() {
                 Modifier.fillMaxWidth().statusBarsPadding().height(48.dp)
             ) {
                 val barWidth = maxWidth
-                val pickerWidth by animateDpAsState(if (viewPickerOpen) 156.dp else 48.dp, label = "view-picker-width")
+                val pickerWidth by animateDpAsState(if (viewPickerOpen) 140.dp else 48.dp, tween(180), label = "view-picker-width")
                 val reserved = if (libraryLoaded) pickerWidth + 48.dp + 42.dp else 30.dp
                 val targetWidth = if (searchOpen) LibraryLogic.searchPillWidth(barWidth.value, reserved.value).dp else 48.dp
                 val searchWidth by animateDpAsState(targetWidth, label = "search-width")
@@ -916,11 +970,7 @@ class MainActivity : ComponentActivity() {
                     selectedSection == LibrarySection.TAGGROUP -> "$selectedFolderName · ${groups.firstOrNull { it.getString("id") == selectedTag }?.getJSONArray("tags")?.length() ?: 0} 个标签"
                     else -> "$selectedFolderName · $assetCount"
                 }
-                var directorySize by remember { mutableStateOf(IntSize(1, 1)) }
-                val menuTransition = remember { MutableTransitionState(false) }
-                menuTransition.targetState = directoryMenuOpen
-                val windowHeight = with(LocalDensity.current) { LocalWindowInfo.current.containerSize.height.toDp() }
-                val menuHeight = (windowHeight - WindowInsets.statusBars.asPaddingValues().calculateTopPadding() - 16.dp).coerceAtLeast(48.dp)
+                SideEffect { directoryHeader = directoryLabel; directoryPull = pullFraction }
                 Row(
                     Modifier.fillMaxSize().padding(horizontal = 12.dp),
                     verticalAlignment = Alignment.CenterVertically
@@ -928,12 +978,14 @@ class MainActivity : ComponentActivity() {
                     if (selectedFolderIds.isNotEmpty()) {
                         SelectionLabel(selectedFolderIds.size, "文件夹", Modifier.weight(1f))
                         SelectionAction(onClick = { downloadFolders() }, enabled = !batchBusy) { Icon(painterResource(R.drawable.ic_download_24), "下载文件夹内原文件", Modifier.size(20.dp)) }
-                        SelectionAction(onClick = { renameFolderOpen = true }, enabled = !batchBusy && selectedFolderIds.size == 1 && canUpload()) { Icon(Icons.Default.Edit, "重命名文件夹", Modifier.size(20.dp)) }
+                        SelectionAction(onClick = { renameFolderOpen = true }, enabled = !batchBusy && canUpload()) { Icon(Icons.Default.Edit, "编辑文件夹", Modifier.size(20.dp)) }
                         SelectionAction(onClick = { moveFoldersOpen = true }, enabled = !batchBusy && canUpload()) { Icon(painterResource(R.drawable.ic_folder_24), "移动文件夹", Modifier.size(20.dp)) }
+                        SelectionAction(onClick = { deleteFoldersCandidate = selectedFolderIds.toSet() }, enabled = !batchBusy && canUpload()) { Icon(painterResource(R.drawable.ic_delete_24), "删除文件夹", Modifier.size(20.dp)) }
                     } else if (selectedTags.isNotEmpty() || selectedTagGroupIds.isNotEmpty()) {
                         SelectionLabel(selectedTags.size + selectedTagGroupIds.size, if (selectedTags.isNotEmpty()) "标签" else "标签组", Modifier.weight(1f))
                         SelectionAction(onClick = { downloadTagSelection() }, enabled = !batchBusy) { Icon(painterResource(R.drawable.ic_download_24), "下载标签内原文件", Modifier.size(20.dp)) }
-                        SelectionAction(onClick = { renameTagOpen = true }, enabled = !batchBusy && canUpload() && selectedTags.size + selectedTagGroupIds.size == 1 && "magle:ungrouped" !in selectedTagGroupIds) { Icon(Icons.Default.Edit, "重命名标签或标签组", Modifier.size(20.dp)) }
+                        SelectionAction(onClick = { renameTagOpen = true }, enabled = !batchBusy && canUpload()) { Icon(Icons.Default.Edit, "编辑标签或标签组", Modifier.size(20.dp)) }
+                        if (selectedTags.isNotEmpty()) SelectionAction(onClick = { moveTagsOpen = true }, enabled = !batchBusy && canUpload()) { Icon(painterResource(R.drawable.ic_bookmark_24), "移动标签到群组", Modifier.size(20.dp)) }
                         if (selectedTags.isNotEmpty()) SelectionAction(onClick = { deleteTagsCandidate = selectedTags.toSet() }, enabled = !batchBusy && canUpload()) {
                             Icon(painterResource(R.drawable.ic_delete_24), "删除标签", Modifier.size(20.dp))
                         }
@@ -960,82 +1012,18 @@ class MainActivity : ComponentActivity() {
                                 contentDescription = if (restoring) "还原选中素材" else "选中素材移到回收站", modifier = Modifier.size(20.dp))
                         }
                     } else {
-                    if (!searchOpen || barWidth >= 700.dp) {
-                        Box(Modifier.weight(1f)) {
-                        Surface(onClick = { viewPickerOpen = false; directoryMenuOpen = true },
-                            enabled = libraryLoaded,
-                            modifier = Modifier.height(48.dp).padding(vertical = 4.dp).widthIn(max = 280.dp).onSizeChanged { directorySize = it },
-                            shape = CircleShape, shadowElevation = 0.dp, color = MaterialTheme.colorScheme.surfaceContainerHigh) {
-                        Row(Modifier.padding(horizontal = 12.dp), verticalAlignment = Alignment.CenterVertically) {
-                            Icon(painterResource(R.drawable.ic_sidebar_24), contentDescription = null, modifier = Modifier.size(20.dp))
-                            Spacer(Modifier.width(6.dp))
-                            Text(
-                                directoryLabel,
-                                style = MaterialTheme.typography.titleMedium.copy(fontSize = 15.sp),
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                                modifier = Modifier.weight(1f, fill = false)
-                            )
-                            if (libraryLoaded) DirectoryRefreshIndicator(pullFraction)
-                        }
-                        }
-                        if (menuTransition.currentState || menuTransition.targetState) Popup(
-                            alignment = Alignment.TopStart,
-                            onDismissRequest = { directoryMenuOpen = false },
-                            properties = PopupProperties(focusable = true)
-                        ) {
-                        androidx.compose.animation.AnimatedVisibility(menuTransition,
-                            modifier = Modifier.padding(top = 4.dp).clip(RoundedCornerShape(20.dp)),
-                            enter = expandIn(tween(220), expandFrom = Alignment.TopStart, initialSize = { directorySize }),
-                            exit = shrinkOut(tween(180), shrinkTowards = Alignment.TopStart, targetSize = { directorySize })) {
-                        Surface(shape = RoundedCornerShape(20.dp), shadowElevation = 0.dp,
-                            color = MaterialTheme.colorScheme.surfaceContainerHigh) {
-                        LazyColumn(Modifier.width((barWidth - 24.dp).coerceAtMost(320.dp) * if (barWidth < 700.dp) .9f else 1f).heightIn(max = menuHeight)) {
-                            item {
-                            Row(Modifier.fillMaxWidth().height(40.dp).clickable { directoryMenuOpen = false }
-                                .padding(horizontal = 12.dp), verticalAlignment = Alignment.CenterVertically) {
-                                Icon(painterResource(R.drawable.ic_sidebar_24), null, Modifier.size(20.dp))
-                                Text(directoryLabel, Modifier.padding(start = 6.dp).weight(1f),
-                                    style = MaterialTheme.typography.titleMedium.copy(fontSize = 15.sp), maxLines = 1, overflow = TextOverflow.Ellipsis)
-                            }
-                            HorizontalDivider()
-                            LibraryMenuItem("全部", R.drawable.ic_grid_view_24, LibrarySection.ALL, counts[LibrarySection.ALL])
-                            LibraryMenuItem("未分类", R.drawable.ic_folder_off_24, LibrarySection.UNFILED, counts[LibrarySection.UNFILED])
-                            LibraryMenuItem("未标签", R.drawable.ic_bookmark_remove_24, LibrarySection.UNTAGGED, counts[LibrarySection.UNTAGGED])
-                            DropdownMenuItem(text = { Text("标签管理") }, leadingIcon = { Icon(painterResource(R.drawable.ic_bookmark_24), contentDescription = null) },
-                                trailingIcon = { IconButton(onClick = { tagManagerOpen = !tagManagerOpen; if (tagManagerOpen) folderGroupOpen = false }) { Icon(if (tagManagerOpen) Icons.Default.KeyboardArrowDown else Icons.AutoMirrored.Filled.KeyboardArrowRight, contentDescription = if (tagManagerOpen) "收起标签管理" else "展开标签管理") } },
-                                onClick = { navigateBrowse(LibrarySection.TAGGROUPS, null, null, "标签管理") })
-                            if (tagManagerOpen) TagMenuItems()
-                            LibraryMenuItem("回收站", R.drawable.ic_delete_24, LibrarySection.TRASH, counts[LibrarySection.TRASH])
-                            DropdownMenuItem(text = { Text("文件夹") }, leadingIcon = { Icon(painterResource(R.drawable.ic_folder_24), contentDescription = null) },
-                                trailingIcon = { IconButton(onClick = {
-                                    folderGroupOpen = !folderGroupOpen
-                                    if (folderGroupOpen) tagManagerOpen = false
-                                }) { Icon(if (folderGroupOpen) Icons.Default.KeyboardArrowDown else Icons.AutoMirrored.Filled.KeyboardArrowRight, contentDescription = if (folderGroupOpen) "收起文件夹" else "展开文件夹") } },
-                                onClick = { navigateBrowse(LibrarySection.FOLDER, null, null, "文件夹") })
-                            }
-                            if (folderGroupOpen) items(flattenVisibleFolders(folderTree, expandedFolderIds, depth = 1), key = { it.node.id }) { row -> FolderMenuItem(row) }
-                        }
-                        }
-                        }
-                        }
-                        }
-                    } else Spacer(Modifier.weight(1f))
+                    Spacer(Modifier.weight(1f))
                     Spacer(Modifier.width(2.dp))
                     SearchPill(searchWidth)
                     if (libraryLoaded) {
                         Spacer(Modifier.width(2.dp))
-                        FilledTonalIconButton(
-                            onClick = { searchOpen = false; viewPickerOpen = false; uploadPicker.launch(arrayOf("image/*")) },
-                            colors = IconButtonDefaults.filledTonalIconButtonColors(containerColor = MaterialTheme.colorScheme.surfaceContainerHigh),
-                            enabled = canUpload() && !batchBusy
-                        ) { Icon(Icons.Default.Add, contentDescription = "上传图片", modifier = Modifier.size(20.dp)) }
+                        AddMenu()
                         Spacer(Modifier.width(2.dp))
                         // Keep the selected button anchored and the outgoing choices stable during collapse.
                         Surface(Modifier.width(pickerWidth).height(48.dp).padding(4.dp), shape = CircleShape,
                             color = MaterialTheme.colorScheme.surfaceContainerHigh) {
                         Box(Modifier.fillMaxSize().clipToBounds()) {
-                            Row(Modifier.wrapContentWidth(Alignment.End, unbounded = true).width(156.dp).align(Alignment.CenterEnd).offset(x = 4.dp),
+                            Row(Modifier.wrapContentWidth(Alignment.End, unbounded = true).width(132.dp).align(Alignment.CenterEnd),
                                 horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                                 AssetViewMode.entries.filter { it != viewPickerBaseMode }.forEach { mode -> ViewModeButton(mode) }
                                 IconButton(
@@ -1044,7 +1032,7 @@ class MainActivity : ComponentActivity() {
                                         if (!viewPickerOpen) viewPickerBaseMode = viewMode
                                         viewPickerOpen = !viewPickerOpen
                                     },
-                                    modifier = Modifier.size(48.dp)
+                                    modifier = Modifier.size(40.dp).clip(CircleShape)
                                 ) { ViewModeIcon(viewMode, MaterialTheme.colorScheme.onSurface) }
                             }
                         }
@@ -1054,6 +1042,52 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+    }
+
+    @Composable
+    private fun AddMenu() {
+        var expanded by remember { mutableStateOf(false) }
+        Box {
+            FilledTonalIconButton(onClick = { searchOpen = false; viewPickerOpen = false; expanded = true },
+                shape = CircleShape, enabled = canUpload() && !batchBusy,
+                colors = IconButtonDefaults.filledTonalIconButtonColors(containerColor = MaterialTheme.colorScheme.surfaceContainerHigh)) {
+                Icon(Icons.Default.Add, "添加", Modifier.size(20.dp))
+            }
+            DropdownMenu(expanded, onDismissRequest = { expanded = false }) {
+                DropdownMenuItem(text = { Text("上传素材") }, leadingIcon = { Icon(painterResource(R.drawable.ic_image_24), null) },
+                    onClick = { expanded = false; uploadPicker.launch(arrayOf("*/*")) })
+                DropdownMenuItem(text = { Text("新建文件夹") }, leadingIcon = { Icon(painterResource(R.drawable.ic_folder_24), null) },
+                    onClick = { expanded = false; newCategory = true })
+                DropdownMenuItem(text = { Text("新建标签") }, leadingIcon = { Icon(painterResource(R.drawable.ic_bookmark_24), null) },
+                    onClick = { expanded = false; newCategory = false })
+            }
+        }
+    }
+
+    @Composable
+    private fun NewCategoryDialog(folder: Boolean) {
+        var name by remember { mutableStateOf("") }
+        val parent = remember { if (folder) LibraryLogic.creationTarget(selectedSection.name, selectedFolderId, true) else null }
+        val group = remember { if (!folder) LibraryLogic.creationTarget(selectedSection.name, selectedTag, false) else null }
+        val position = remember { if (folder) flatFolderTree.firstOrNull { it.id == parent }?.name ?: "库根目录"
+            else tagGroups.firstOrNull { it.optString("id") == group }?.optString("name") ?: "未分组" }
+        val valid = runCatching { if (folder) LibraryLogic.validName(name) else LibraryLogic.validTagName(name) }.isSuccess
+        AlertDialog(onDismissRequest = { newCategory = null }, title = { Text(if (folder) "新建文件夹" else "新建标签") },
+            text = { Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                OutlinedTextField(value = name, onValueChange = { name = it }, singleLine = true, label = { Text("名称") })
+                Text("位置：$position", style = MaterialTheme.typography.bodyMedium)
+            } }, confirmButton = { TextButton(enabled = valid && canUpload() && !batchBusy, onClick = {
+                val clean = name.trim()
+                if (!folder && (clean in libraryTags || indexedAssets.any { clean in it.tags } || tagGroups.any { clean in jsonStrings(it, "tags") })) {
+                    Toast.makeText(this@MainActivity, "这个标签已存在", Toast.LENGTH_SHORT).show()
+                } else {
+                    newCategory = null
+                    editLibraryStructure(if (folder) "新建文件夹" else "新建标签") {
+                        if (folder) LibraryLogic.createFolder(it, java.util.UUID.randomUUID().toString().uppercase(Locale.ROOT), clean, parent)
+                        else LibraryLogic.createTag(it, clean, group)
+                    }
+                }
+            }) { Text("创建") } }, dismissButton = { TextButton(onClick = { newCategory = null }) { Text("取消") } })
     }
 
     @Composable
@@ -1102,7 +1136,7 @@ class MainActivity : ComponentActivity() {
         val selected = viewMode == mode
         IconButton(
             onClick = { if (viewPickerOpen) { searchOpen = false; viewMode = mode; saveViewerPreferences(); viewPickerOpen = false } },
-            modifier = Modifier.size(48.dp)
+            modifier = Modifier.size(40.dp).clip(CircleShape)
         ) {
             Box(contentAlignment = Alignment.Center) {
                 ViewModeIcon(
@@ -1153,6 +1187,104 @@ class MainActivity : ComponentActivity() {
     }
 
     @Composable
+    private fun DirectoryPanel(pinned: Boolean, wide: Boolean) {
+        val visible = pinned || directoryMenuOpen || (!hasSelection() && (!searchOpen || wide))
+        if (!visible) return
+        val groups = remember(tagGroups, indexedAssets, libraryTags) { availableTagGroups() }
+        val folderRows = remember(folderTree, expandedFolderIds) { flattenVisibleFolders(folderTree, expandedFolderIds, depth = 1) }
+        val rows = 6 + (if (folderGroupOpen) folderRows.size else 0) + (if (tagManagerOpen) groups.sumOf { 1 + if (it.optString("id") in expandedTagGroups) (it.optJSONArray("tags")?.length() ?: 0) else 0 } else 0)
+        val label = directoryHeader.ifEmpty { selectedFolderName }
+        val labelStyle = MaterialTheme.typography.titleMedium.copy(fontSize = 15.sp)
+        val textWidth = with(LocalDensity.current) { rememberTextMeasurer().measure(label, labelStyle, maxLines = 1).size.width.toDp() }
+        val reveal by animateFloatAsState(if (indexing) 1f else (directoryPull() * 2f).coerceIn(0f, 1f), tween(80), label = "directory-title-refresh-space")
+        BoxWithConstraints(Modifier.fillMaxSize().statusBarsPadding().navigationBarsPadding().padding(start = 12.dp, end = 12.dp, top = 4.dp, bottom = 8.dp)) {
+            val expanded = libraryLoaded && (directoryMenuOpen || pinned)
+            val transition = updateTransition(expanded, label = "directory-panel")
+            val expandedWidth = minOf(320.dp * if (wide) 1f else .9f, maxWidth)
+            val collapsedWidth = minOf(280.dp, maxWidth, 50.dp + textWidth + 26.dp * reveal)
+            val width by transition.animateDp({ tween(220) }, label = "width") { if (it) expandedWidth else collapsedWidth }
+            val height by transition.animateDp({ tween(220) }, label = "height") {
+                if (!it) 40.dp else if (pinned) maxHeight else minOf(maxHeight, 41.dp + 48.dp * rows)
+            }
+            Surface(Modifier.width(width).height(height), shape = RoundedCornerShape(20.dp), color = MaterialTheme.colorScheme.surfaceContainerHigh) {
+                Column(Modifier.clipToBounds()) {
+                    Row(Modifier.fillMaxWidth().height(40.dp).clickable(enabled = libraryLoaded && !expanded) { viewPickerOpen = false; directoryMenuOpen = true }.padding(start = 12.dp, end = if (expanded) 0.dp else 12.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Icon(painterResource(R.drawable.ic_sidebar_24), null, Modifier.size(20.dp))
+                        Text(label, Modifier.padding(start = 6.dp).weight(1f), style = labelStyle, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        if (libraryLoaded) DirectoryRefreshIndicator { directoryPull() }
+                        if (wide && (transition.currentState || transition.targetState)) IconButton(onClick = {
+                            directoryPinned = !pinned
+                            directoryMenuOpen = false
+                            if (directoryPinned) { folderGroupOpen = true; tagManagerOpen = false }
+                            saveViewerPreferences()
+                        }, modifier = Modifier.size(40.dp)) {
+                            Icon(painterResource(R.drawable.ic_push_pin_24), if (pinned) "取消固定目录" else "固定目录", Modifier.size(20.dp), tint = if (pinned) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                    }
+                    if (transition.currentState || transition.targetState) {
+                        HorizontalDivider()
+                        DirectoryList(Modifier.fillMaxWidth().weight(1f))
+                    }
+                }
+            }
+        }
+    }
+
+    @Composable
+    private fun DirectoryList(modifier: Modifier) {
+        val counts = browseStatistics.sections
+        val scroll = rememberLazyListState()
+        val scope = rememberCoroutineScope()
+        fun toggleFolders() {
+            scope.launch {
+                // Keep the section header visible before its scrollable contents disappear.
+                if (folderGroupOpen) scroll.animateScrollToItem(0)
+                folderGroupOpen = !folderGroupOpen
+                if (folderGroupOpen) tagManagerOpen = false
+            }
+        }
+        LazyColumn(modifier, state = scroll) {
+            item {
+                            LibraryMenuItem("全部", R.drawable.ic_grid_view_24, LibrarySection.ALL, counts[LibrarySection.ALL])
+                            LibraryMenuItem("未分类", R.drawable.ic_folder_off_24, LibrarySection.UNFILED, counts[LibrarySection.UNFILED])
+                            LibraryMenuItem("未标签", R.drawable.ic_bookmark_remove_24, LibrarySection.UNTAGGED, counts[LibrarySection.UNTAGGED])
+                            DropdownMenuItem(text = { Text("标签管理") }, leadingIcon = { Icon(painterResource(R.drawable.ic_bookmark_24), contentDescription = null) },
+                                trailingIcon = { IconButton(onClick = { tagManagerOpen = !tagManagerOpen; if (tagManagerOpen) folderGroupOpen = false }) { ExpansionArrow(tagManagerOpen, if (tagManagerOpen) "收起标签管理" else "展开标签管理") } },
+                                onClick = { navigateBrowse(LibrarySection.TAGGROUPS, null, null, "标签管理") })
+                            androidx.compose.animation.AnimatedVisibility(tagManagerOpen, enter = expandVertically(tween(180)) + fadeIn(tween(180)), exit = shrinkVertically(tween(160)) + fadeOut(tween(160))) {
+                                Column { TagMenuItems() }
+                            }
+                            LibraryMenuItem("回收站", R.drawable.ic_delete_24, LibrarySection.TRASH, counts[LibrarySection.TRASH])
+                            DropdownMenuItem(text = { Text("文件夹") }, leadingIcon = { Icon(painterResource(R.drawable.ic_folder_24), contentDescription = null) },
+                                trailingIcon = { IconButton(onClick = ::toggleFolders) { ExpansionArrow(folderGroupOpen, if (folderGroupOpen) "收起文件夹" else "展开文件夹") } },
+                                onClick = { navigateBrowse(LibrarySection.FOLDER, null, null, "文件夹") })
+                            AnimatedVisibility(folderGroupOpen, enter = expandVertically(tween(180)) + fadeIn(tween(180)), exit = shrinkVertically(tween(160)) + fadeOut(tween(160))) {
+                                Column { DirectoryFolderItems(folderTree, depth = 1) }
+                            }
+            }
+        }
+    }
+
+    @Composable
+    private fun DirectoryFolderItems(nodes: List<FolderNode>, depth: Int) {
+        nodes.forEach { node -> key(node.id) {
+            FolderMenuItem(FolderRow(node, depth))
+            if (node.children.isNotEmpty()) AnimatedVisibility(node.id in expandedFolderIds,
+                enter = expandVertically(tween(180), expandFrom = Alignment.Top) + fadeIn(tween(180)),
+                exit = shrinkVertically(tween(160), shrinkTowards = Alignment.Top) + fadeOut(tween(160))) {
+                Column { DirectoryFolderItems(node.children, depth + 1) }
+            }
+        } }
+    }
+
+    @Composable
+    private fun ExpansionArrow(expanded: Boolean, description: String) {
+        val angle by animateFloatAsState(if (expanded) 90f else 0f, tween(180), label = "expansion-arrow")
+        val direction = if (LocalLayoutDirection.current == LayoutDirection.Rtl) -1f else 1f
+        Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, description, Modifier.graphicsLayer { rotationZ = angle * direction })
+    }
+
+    @Composable
     private fun LibraryMenuItem(label: String, icon: Int, section: LibrarySection, count: Int? = null) {
         DropdownMenuItem(
             text = {
@@ -1171,7 +1303,7 @@ class MainActivity : ComponentActivity() {
         val counts = remember(indexedAssets) {
             indexedAssets.filterNot { it.isDeleted }.flatMap { it.tags.distinct() }.groupingBy { it }.eachCount().toSortedMap()
         }
-        val groups = remember(tagGroups, indexedAssets) { availableTagGroups() }
+        val groups = remember(tagGroups, indexedAssets, libraryTags) { availableTagGroups() }
         groups.forEach { group ->
             val id = group.getString("id")
             val tags = group.getJSONArray("tags").let { array -> (0 until array.length()).map { array.getString(it) } }
@@ -1185,10 +1317,10 @@ class MainActivity : ComponentActivity() {
             }, trailingIcon = { Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(tags.size.toString())
                 IconButton(onClick = { expandedTagGroups = if (open) expandedTagGroups - id else expandedTagGroups + id }) {
-                    Icon(if (open) Icons.Default.KeyboardArrowDown else Icons.AutoMirrored.Filled.KeyboardArrowRight, if (open) "收起群组" else "展开群组")
+                    ExpansionArrow(open, if (open) "收起群组" else "展开群组")
                 }
             } }, onClick = { navigateBrowse(LibrarySection.TAGGROUP, null, id, group.getString("name")) })
-            if (open) tags.forEach { tag ->
+            AnimatedVisibility(open, enter = expandVertically(tween(180)) + fadeIn(tween(180)), exit = shrinkVertically(tween(160)) + fadeOut(tween(160))) { Column { tags.forEach { tag ->
                 DropdownMenuItem(text = {
                     Row(Modifier.padding(start = 38.dp), verticalAlignment = Alignment.CenterVertically) {
                         Icon(painterResource(R.drawable.ic_bookmark_24), contentDescription = null, tint = color, modifier = Modifier.size(16.dp))
@@ -1197,7 +1329,7 @@ class MainActivity : ComponentActivity() {
                 }, trailingIcon = { Text((counts[tag] ?: 0).toString()) }, onClick = {
                     navigateBrowse(LibrarySection.TAG, null, tag, tag, parentGroupId = id)
                 })
-            }
+            } } }
         }
         if (groups.isEmpty()) DropdownMenuItem(text = { Text("暂无标签群组") }, onClick = {}, enabled = false)
     }
@@ -1209,6 +1341,7 @@ class MainActivity : ComponentActivity() {
             "orange" -> "#FFA726"
             "yellow" -> "#FFCA28"
             "green" -> "#66BB6A"
+            "aqua" -> "#26C6DA"
             "blue" -> "#42A5F5"
             "purple" -> "#AB47BC"
             "pink" -> "#EC407A"
@@ -1228,7 +1361,7 @@ class MainActivity : ComponentActivity() {
         val selectedTag = location.tag
         val selectedSection = location.section
         val searchQuery = location.query
-        val groups = remember(tagGroups, indexedAssets) { availableTagGroups() }
+        val groups = remember(tagGroups, indexedAssets, libraryTags) { availableTagGroups() }
         val group = groups.firstOrNull { it.getString("id") == selectedTag }
         val root = selectedSection == LibrarySection.TAGGROUPS
         var groupsOpen by rememberSaveable { mutableStateOf(true) }
@@ -1246,7 +1379,7 @@ class MainActivity : ComponentActivity() {
         val iconSize by animateDpAsState((38.4f * folderScale).dp, tween(140), label = "tag-icon-size")
         LazyColumn(modifier.fillMaxSize().navigationBarsPadding(), contentPadding = androidx.compose.foundation.layout.PaddingValues(start = 12.dp, top = WindowInsets.statusBars.asPaddingValues().calculateTopPadding() + 68.dp, end = 12.dp, bottom = 104.dp)) {
             if (root && shownGroups.isNotEmpty()) item(key = "groups") {
-                Card(Modifier.fillMaxWidth().assetPinchZoom(viewMode, folderArea = true), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer)) {
+                Card(Modifier.fillMaxWidth().assetPinchZoom(viewMode, folderArea = true), shape = RoundedCornerShape(20.dp), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer)) {
                 Column(Modifier.fillMaxWidth().animateContentSize(tween(140)).padding(horizontal = 8.dp, vertical = 4.dp)) {
                     Row(Modifier.fillMaxWidth().clickable { groupsOpen = !groupsOpen }, verticalAlignment = Alignment.CenterVertically) {
                         IconButton(onClick = { groupsOpen = !groupsOpen }, modifier = Modifier.size(40.dp)) {
@@ -1344,58 +1477,64 @@ class MainActivity : ComponentActivity() {
         if (groupId == "magle:ungrouped") return
         val clean = LibraryLogic.validTagName(name)
         if (old == null) {
-            val expectedName = tagGroups.firstOrNull { it.optString("id") == groupId }?.optString("name")
-            batchBusy = true
-            queueEdit {
-                val result = runCatching { mutateLibraryNow {
-                    if (LibraryLogic.tagGroups(it).firstOrNull { group -> group.optString("id") == groupId }?.optString("name") != expectedName) throw LibraryConflict()
-                    LibraryLogic.renameTagGroup(it, groupId!!, clean)
-                } }
-                runOnUiThread {
-                    batchBusy = false
-                    result.onSuccess {
-                        tagGroups = LibraryLogic.tagGroups(it)
-                        browseHistory = browseHistory.map { location ->
-                            if (location.section == LibrarySection.TAGGROUP && location.tag == groupId) location.copy(name = clean) else location
-                        }
-                        if (selectedSection == LibrarySection.TAGGROUP && selectedTag == groupId) selectedFolderName = clean
-                        clearSelection()
-                    }.onFailure { Toast.makeText(this, "重命名失败：${it.message}", Toast.LENGTH_LONG).show() }
-                }
-            }
+            saveCategoryEdit(clean, null, null)
             return
         }
         if (clean == old) return
         if (tagRenameFile().baseFile.exists()) {
-            Toast.makeText(this, "还有未完成的标签编辑，请先在设置中继续", Toast.LENGTH_LONG).show()
+            Toast.makeText(this, "还有未完成的批量编辑，请先在设置中继续", Toast.LENGTH_LONG).show()
             return
         }
-        if (indexedAssets.any { clean in it.tags } || tagGroups.any { clean in jsonStrings(it, "tags") }) {
+        if (clean in libraryTags || indexedAssets.any { clean in it.tags } || tagGroups.any { clean in jsonStrings(it, "tags") }) {
             Toast.makeText(this, "这个标签名已存在，请使用其他名称", Toast.LENGTH_LONG).show()
             return
         }
         runTagRename(old, clean)
     }
 
-    private fun runTagRename(old: String? = null, name: String? = null, deleteTags: Set<String> = emptySet()) {
+    private fun renameTagBrowse(old: String, name: String) {
+        browseHistory = browseHistory.map { if (it.section == LibrarySection.TAG && it.tag == old) it.copy(tag = name, name = name) else it }
+        if (selectedSection == LibrarySection.TAG && selectedTag == old) { selectedTag = name; selectedFolderName = name }
+    }
+
+    private fun runTagRename(old: String? = null, name: String? = null, deleteTags: Set<String> = emptySet(),
+        deleteFolders: Set<String> = emptySet(), recycleFolderAssets: Boolean = false) {
         if (batchBusy || !canUpload()) return
-        if ((old != null || deleteTags.isNotEmpty()) && tagRenameFile().baseFile.exists()) {
-            Toast.makeText(this, "还有未完成的标签编辑，请先在设置中继续", Toast.LENGTH_LONG).show()
+        if ((old != null || deleteTags.isNotEmpty() || deleteFolders.isNotEmpty()) && tagRenameFile().baseFile.exists()) {
+            Toast.makeText(this, "还有未完成的批量编辑，请先在设置中继续", Toast.LENGTH_LONG).show()
             return
         }
+        val optimisticRename = old != null && name != null && deleteTags.isEmpty() && deleteFolders.isEmpty()
+        val beforeStructure = if (optimisticRename) structureSnapshot() else null
+        val beforeAssets = if (optimisticRename) indexedAssets else emptyList()
+        if (optimisticRename) {
+            val preview = JSONObject(beforeStructure!!.toString())
+            LibraryLogic.renameTagReferences(preview, old, name)
+            applyStructureMetadata(preview)
+            indexedAssets = beforeAssets.map { asset -> asset.copy(tags = asset.tags.map { if (it == old) name!! else it }.distinct()) }
+            infoAsset = infoAsset?.let { shown -> indexedAssets.firstOrNull { it.id == shown.id } ?: shown }
+            renameTagBrowse(old!!, name!!)
+            clearSelection()
+            categorySavePending = true
+            Toast.makeText(this, "正在后台保存，可继续浏览", Toast.LENGTH_SHORT).show()
+        }
         val deleting = deleteTags.isNotEmpty()
+        val deletingFolders = deleteFolders.isNotEmpty()
         batchBusy = true
         attemptedTagResume = true
-        tagRenameStatus = "正在准备标签编辑…"
+        tagRenameStatus = "正在准备${if (deletingFolders) "文件夹删除" else "标签编辑"}…"
         queueEdit {
             val changed = mutableMapOf<String, AssetMeta>()
             var task = pendingTagRename()
-            val snapshot = editSnapshot()
+            val snapshot = loadIndexCache().values.toList().ifEmpty { if (optimisticRename) beforeAssets else indexedAssets }
             val result = runCatching {
                 if (task == null) {
-                    check((deleting || (old != null && name != null)) && !tagRenameFile().baseFile.exists()) { "未完成任务属于其他素材库，请切换到原库继续" }
+                    check((deleting || deletingFolders || (old != null && name != null)) && !tagRenameFile().baseFile.exists()) { "未完成任务属于其他素材库，请切换到原库继续" }
                     deleteTags.forEach { LibraryLogic.validTagName(it) }
-                    val allIds = listAssetIds(libraryId!!).let { if (deleting) it else it - loadIgnoredIndexCache().keys }
+                    val root = JSONObject(String(readLibraryFile(libraryId!!, "metadata.json"), StandardCharsets.UTF_8))
+                    val folderSnapshot = if (deletingFolders) LibraryLogic.folderDeletionSnapshot(root, deleteFolders) else JSONArray()
+                    val removedFolderIds = LibraryLogic.folderIds(folderSnapshot)
+                    val allIds = listAssetIds(libraryId!!).let { if (deleting || deletingFolders) it else it - loadIgnoredIndexCache().keys }
                     val ids = mutableListOf<String>()
                     // Preflight the whole library, including uncached items, before any tag is changed.
                     for (chunk in allIds.chunked(8)) {
@@ -1403,26 +1542,33 @@ class MainActivity : ComponentActivity() {
                         try {
                             for (read in reads) {
                                 val asset = read.get() ?: continue
-                                if (!deleting) check(name !in asset.tags) { "这个标签名已存在，请使用其他名称；尚未修改素材" }
-                                if (if (deleting) asset.tags.any { it in deleteTags } else old in asset.tags) ids += asset.id
+                                if (!deleting && !deletingFolders) check(name !in asset.tags) { "这个标签名已存在，请使用其他名称；尚未修改素材" }
+                                if (when { deletingFolders -> asset.folders.any { it in removedFolderIds }; deleting -> asset.tags.any { it in deleteTags }; else -> old in asset.tags }) ids += asset.id
                             }
                         } finally { reads.filterNot { it.isDone }.forEach { it.cancel(true) } }
                     }
-                    val root = JSONObject(String(readLibraryFile(libraryId!!, "metadata.json"), StandardCharsets.UTF_8))
-                    if (!deleting) check(LibraryLogic.tagGroups(root).none { name in jsonStrings(it, "tags") }) { "这个标签名已存在，请使用其他名称" }
+                    if (!deleting && !deletingFolders) check(name !in jsonStrings(root, "tags") && LibraryLogic.tagGroups(root).none { name in jsonStrings(it, "tags") }) { "这个标签名已存在，请使用其他名称" }
                     task = TagRenameTask(JSONObject().put("source", source.name).put("libraryId", libraryId)
-                        .put("driveId", driveId.orEmpty()).put("old", if (deleting) deleteTags.first() else old).put("name", if (deleting) "" else name)
+                        .put("driveId", driveId.orEmpty()).put("old", if (deletingFolders) "文件夹" else if (deleting) deleteTags.first() else old).put("name", if (deleting || deletingFolders) "" else name)
                         .put("deleteTags", JSONArray(deleteTags))
+                        .put("deleteFolders", folderSnapshot).put("recycleFolderAssets", recycleFolderAssets)
                         .put("ids", JSONArray(ids)).put("done", JSONArray()))
                     saveTagRename(task)
                 }
                 val current = task
                 val done = current.done
                 // Deletion rechecks completed items too: a crash may precede the local cache update.
-                for (id in if (current.deleting) current.ids else current.ids.filterNot { it in done }) {
+                for (id in if (current.deleting || current.deletingFolders) current.ids else current.ids.filterNot { it in done }) {
                     if (Thread.currentThread().isInterrupted) throw InterruptedException()
                     val asset = fetchAssetMetadata(id, 0)
-                    if (current.deleting && asset != null) {
+                    if (current.deletingFolders && asset != null) {
+                        if (asset.folders.any { it in current.deletedFolderIds }) {
+                            changed[id] = mutateAssetNow(asset) { LibraryLogic.removeFolderReferences(it, current.deletedFolderIds, current.recycleFolderAssets) }
+                        } else {
+                            mergeLibraryMtime(id, maxOf(asset.mtime, System.currentTimeMillis()))
+                            changed[id] = asset
+                        }
+                    } else if (current.deleting && asset != null) {
                         if (asset.tags.any { it in current.deletedTags }) {
                             changed[id] = mutateAssetNow(asset) { LibraryLogic.deleteTagReferences(it, current.deletedTags) }
                         } else {
@@ -1444,8 +1590,9 @@ class MainActivity : ComponentActivity() {
                     runOnUiThread { tagRenameStatus = progress }
                 }
                 val metadata = mutateLibraryNow {
-                    val tags = LibraryLogic.tagGroups(it).flatMap { group -> jsonStrings(group, "tags") }
-                    if (current.deleting) LibraryLogic.deleteTagReferences(it, current.deletedTags) else {
+                    val tags = jsonStrings(it, "tags") + LibraryLogic.tagGroups(it).flatMap { group -> jsonStrings(group, "tags") }
+                    if (current.deletingFolders) LibraryLogic.removeFolders(it, current.folderSnapshot)
+                    else if (current.deleting) LibraryLogic.deleteTagReferences(it, current.deletedTags) else {
                         if (current.old in tags && current.name in tags) throw LibraryConflict("标签组已同时包含新旧标签，请先核对，进度已保留")
                         LibraryLogic.renameTagReferences(it, current.old, current.name)
                     }
@@ -1460,10 +1607,16 @@ class MainActivity : ComponentActivity() {
             }
             runOnUiThread {
                 batchBusy = false
+                if (optimisticRename) categorySavePending = false
                 result.onSuccess {
-                    tagGroups = LibraryLogic.tagGroups(it)
+                    tagGroups = LibraryLogic.tagGroups(it); libraryTags = jsonStrings(it, "tags")
                     val current = task!!
-                    if (current.deleting) {
+                    if (current.deletingFolders) {
+                        folderTree = parseFolders(it.getJSONArray("folders"))
+                        browseHistory = browseHistory.filterNot { location -> location.folderId in current.deletedFolderIds }
+                        expandedFolderIds = expandedFolderIds - current.deletedFolderIds
+                        if (selectedFolderId in current.deletedFolderIds) navigateBrowse(LibrarySection.FOLDER, null, null, "文件夹")
+                    } else if (current.deleting) {
                         browseHistory = browseHistory.filterNot { it.section == LibrarySection.TAG && it.tag in current.deletedTags }
                         if (selectedSection == LibrarySection.TAG && selectedTag in current.deletedTags)
                             navigateBrowse(LibrarySection.TAGGROUPS, null, null, "标签管理")
@@ -1477,12 +1630,18 @@ class MainActivity : ComponentActivity() {
                         }
                     }
                     tagRenameStatus = ""
-                    clearSelection()
-                    Toast.makeText(this, "${current.label}完成", Toast.LENGTH_SHORT).show()
+                    if (!optimisticRename) clearSelection()
+                    Toast.makeText(this, if (optimisticRename) "已更改成功" else "${current.label}完成", Toast.LENGTH_SHORT).show()
                 }.onFailure {
-                    tagRenameStatus = if (pendingTagRename() != null) "标签编辑未完成，进度已保留：${it.message}"
-                        else "标签编辑尚未开始：${it.message}"
-                    Toast.makeText(this, tagRenameStatus, Toast.LENGTH_LONG).show()
+                    if (optimisticRename) {
+                        applyStructureMetadata(beforeStructure!!)
+                        indexedAssets = beforeAssets
+                        infoAsset = infoAsset?.let { shown -> beforeAssets.firstOrNull { it.id == shown.id } ?: shown }
+                        renameTagBrowse(name!!, old!!)
+                    }
+                    tagRenameStatus = if (pendingTagRename() != null) "批量编辑未完成，进度已保留：${it.message}"
+                        else "批量编辑尚未开始：${it.message}"
+                    Toast.makeText(this, if (optimisticRename) "更改失败，已恢复原来的样式。$tagRenameStatus" else tagRenameStatus, Toast.LENGTH_LONG).show()
                 }
             }
         }
@@ -1505,7 +1664,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun navigateBrowse(section: LibrarySection, folderId: String?, tag: String?, name: String, parentGroupId: String? = null, fromSearch: Boolean = false) {
-        if (batchBusy) return
+        if (batchBusy && !categorySavePending) return
         val current = currentBrowse()
         val target = BrowseLocation(nextBrowseKey, section, folderId, tag, name, "", includeSubfolderAssets, viewMode,
             searchReturnKey = current.key.takeIf { fromSearch && current.query.isNotBlank() })
@@ -1568,7 +1727,7 @@ class MainActivity : ComponentActivity() {
                 child.id to LibraryLogic.folderAssetCount(browseStatistics.folders, ids)
             }
         }
-        Card(Modifier.fillMaxWidth().assetPinchZoom(viewMode, folderArea = true), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer)) {
+        Card(Modifier.fillMaxWidth().assetPinchZoom(viewMode, folderArea = true), shape = RoundedCornerShape(20.dp), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer)) {
             Column(Modifier.animateContentSize(tween(140)).padding(horizontal = 8.dp, vertical = 4.dp)) {
                 Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                     Row(Modifier.weight(1f).clickable { open = !open }, verticalAlignment = Alignment.CenterVertically) {
@@ -1605,8 +1764,7 @@ class MainActivity : ComponentActivity() {
                 onLongClick = { if (selectedAssetIds.isNotEmpty()) clearSelection(); selectedFolderIds = selectedFolderIds + folder.id; searchOpen = false; viewPickerOpen = false; directoryMenuOpen = false })
             .semantics { selected = chosen }.padding(vertical = 6.dp),
             horizontalAlignment = Alignment.CenterHorizontally) {
-            Icon(painterResource(R.drawable.ic_folder_24), contentDescription = null,
-                tint = tagGroupColor(folder.iconColor), modifier = Modifier.size(iconSize))
+            FolderIcon(storedFolderIcon(folder.id), tagGroupColor(folder.iconColor), Modifier.size(iconSize))
             Text("${folder.name} · $count", Modifier.fillMaxWidth(), textAlign = androidx.compose.ui.text.style.TextAlign.Center,
                 style = MaterialTheme.typography.labelSmall, maxLines = 2, overflow = TextOverflow.Ellipsis)
         }
@@ -1615,6 +1773,7 @@ class MainActivity : ComponentActivity() {
     @Composable
     private fun FolderMenuItem(
         row: FolderRow,
+        modifier: Modifier = Modifier,
         expanded: Set<String> = expandedFolderIds,
         selected: Set<String> = setOfNotNull(selectedFolderId),
         onExpand: (String) -> Unit = { id -> expandedFolderIds = if (id in expandedFolderIds) expandedFolderIds - id else expandedFolderIds + id },
@@ -1624,17 +1783,13 @@ class MainActivity : ComponentActivity() {
         multiple: Boolean = false
     ) {
         DropdownMenuItem(
+            modifier = modifier,
             text = {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     if (multiple) { PickerCheckbox(row.node.id in selected,
                         allFolders(row.node.children).any { it.id in selected }); Spacer(Modifier.width(16.dp)) }
                     Spacer(Modifier.width((row.depth * 16).dp))
-                    Icon(
-                        painterResource(R.drawable.ic_folder_24),
-                        contentDescription = null,
-                        tint = tagGroupColor(row.node.iconColor),
-                        modifier = Modifier.size(22.dp)
-                    )
+                    FolderIcon(storedFolderIcon(row.node.id), tagGroupColor(row.node.iconColor), Modifier.size(22.dp))
                     Spacer(Modifier.width(10.dp))
                     Text(
                         row.node.name,
@@ -1648,8 +1803,7 @@ class MainActivity : ComponentActivity() {
             },
             trailingIcon = {
                 if (row.node.children.isNotEmpty()) IconButton(onClick = { onExpand(row.node.id) }) {
-                    Icon(if (row.node.id in expanded) Icons.Default.KeyboardArrowDown else Icons.AutoMirrored.Filled.KeyboardArrowRight,
-                        contentDescription = if (row.node.id in expanded) "收起" else "展开")
+                    ExpansionArrow(row.node.id in expanded, if (row.node.id in expanded) "收起" else "展开")
                 }
             },
             onClick = {
@@ -1721,7 +1875,7 @@ class MainActivity : ComponentActivity() {
             folder.id to LibraryLogic.folderAssetCount(browseStatistics.folders, allFolders(listOf(folder)).map { it.id }.toSet())
         } }
         Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerHigh)) {
+            Card(shape = RoundedCornerShape(20.dp), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerHigh)) {
                 Row(Modifier.fillMaxWidth().clickable { tagsOpen = !tagsOpen }.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
                     Icon(if (tagsOpen) Icons.Default.KeyboardArrowDown else Icons.AutoMirrored.Filled.KeyboardArrowRight, "展开或收起标签")
                     Text("标签 · ${tags.size}", style = MaterialTheme.typography.labelLarge)
@@ -1732,7 +1886,7 @@ class MainActivity : ComponentActivity() {
                     }
                 }
             }
-            Card(Modifier.assetPinchZoom(viewMode, folderArea = true), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerHigh)) {
+            Card(Modifier.assetPinchZoom(viewMode, folderArea = true), shape = RoundedCornerShape(20.dp), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerHigh)) {
                 Row(Modifier.fillMaxWidth().clickable { foldersOpen = !foldersOpen }.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
                     Icon(if (foldersOpen) Icons.Default.KeyboardArrowDown else Icons.AutoMirrored.Filled.KeyboardArrowRight, "展开或收起文件夹")
                     Text("文件夹 · ${folders.size}", style = MaterialTheme.typography.labelLarge)
@@ -1844,7 +1998,7 @@ class MainActivity : ComponentActivity() {
                     verticalItemSpacing = 8.dp
                 ) {
                     if (headerCount > 0) item(key = "browse-header", span = StaggeredGridItemSpan.FullLine) { header() }
-                    items(assets, key = { it.id }, contentType = { "asset" }) { asset -> AssetTile(asset, true, assets, Modifier.animateItem(), cellWidth) }
+                    items(assets, key = { it.id }, contentType = { "asset" }) { asset -> AssetTile(asset, selectionList = assets, cellWidth = cellWidth, modifier = Modifier.animateItem(), naturalRatio = true) }
                 }
             }
         }
@@ -2001,7 +2155,7 @@ class MainActivity : ComponentActivity() {
     }
 
     @Composable
-    private fun AssetTile(asset: AssetMeta, naturalRatio: Boolean = false, selectionList: List<AssetMeta>, modifier: Modifier = Modifier, cellWidth: Int) {
+    private fun AssetTile(asset: AssetMeta, selectionList: List<AssetMeta>, cellWidth: Int, modifier: Modifier = Modifier, naturalRatio: Boolean = false) {
         var retryEpoch by remember(asset.id) { mutableIntStateOf(0) }
         val preview = assetThumbnail(asset, LibraryLogic.thumbnailEdge(asset.width, asset.height, cellWidth, naturalRatio), retryEpoch)
         val bitmap = preview.bitmap
@@ -2037,32 +2191,40 @@ class MainActivity : ComponentActivity() {
         var retryEpoch by remember(asset.id) { mutableIntStateOf(0) }
         val preview = assetThumbnail(asset, LibraryLogic.thumbnailEdge(asset.width, asset.height, cellWidth, false), retryEpoch)
         val bitmap = preview.bitmap
-        ElevatedCard(
-            modifier = modifier.fillMaxWidth().assetInteraction(asset, selectionList)
-        ) {
-            Box {
-            Row(Modifier.fillMaxWidth().height(rowHeight), verticalAlignment = Alignment.CenterVertically) {
-                Box(
-                    Modifier.size(rowHeight).clip(CardDefaults.shape).background(MaterialTheme.colorScheme.surfaceContainerHighest),
-                    contentAlignment = Alignment.Center
-                ) {
-                    if (bitmap == null && preview.loading) CircularProgressIndicator(Modifier.size(22.dp), strokeWidth = 2.dp)
-                    else if (bitmap == null) {
-                        if (preview.unavailable) Text(asset.ext.uppercase(Locale.ROOT), style = MaterialTheme.typography.titleMedium)
-                        else TextButton(onClick = { retryEpoch++ }) { Text("重试") }
-                    }
-                    else Image(bitmap.asImageBitmap(), asset.name, Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
-                }
-                Column(Modifier.weight(1f).padding(horizontal = 10.dp)) {
-                    Text(asset.name, maxLines = if (rowHeight < 52.dp) 1 else 2, overflow = TextOverflow.Ellipsis,
-                        style = if (rowHeight < 52.dp) MaterialTheme.typography.bodySmall else MaterialTheme.typography.bodyMedium)
-                    if (rowHeight >= 52.dp) Text(
-                        "${asset.ext.uppercase(Locale.ROOT)} · ${formatBytes(asset.size)}",
-                        style = MaterialTheme.typography.labelMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                }
+        val compact = rowHeight < 72.dp
+        val thumbnailSize = if (compact) rowHeight else rowHeight - 16.dp
+        val thumbnail: @Composable () -> Unit = {
+            Box(Modifier.size(thumbnailSize).clip(CardDefaults.shape).background(MaterialTheme.colorScheme.surfaceContainerHighest),
+                contentAlignment = Alignment.Center) {
+                if (bitmap == null && preview.loading) CircularProgressIndicator(Modifier.size(22.dp), strokeWidth = 2.dp)
+                else if (bitmap == null) {
+                    if (preview.unavailable) Text(asset.ext.uppercase(Locale.ROOT), style = MaterialTheme.typography.titleMedium)
+                    else TextButton(onClick = { retryEpoch++ }) { Text("重试") }
+                } else Image(bitmap.asImageBitmap(), asset.name, Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
             }
+        }
+        val information = "${asset.ext.uppercase(Locale.ROOT)} · ${formatBytes(asset.size)}"
+        Box(modifier.fillMaxWidth().height(rowHeight).assetInteraction(asset, selectionList)) {
+            if (!compact) ListItem(
+                modifier = Modifier.fillMaxSize(),
+                colors = ListItemDefaults.colors(containerColor = androidx.compose.ui.graphics.Color.Transparent),
+                leadingContent = thumbnail,
+                headlineContent = {
+                    Text(asset.name, maxLines = if (rowHeight >= 86.dp) 2 else 1, overflow = TextOverflow.Ellipsis,
+                        style = MaterialTheme.typography.titleMedium.copy(fontSize = 18.sp, lineHeight = 24.sp))
+                },
+                supportingContent = {
+                    Text(information, Modifier.padding(top = 6.dp), style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                })
+            else Row(Modifier.fillMaxSize(), verticalAlignment = Alignment.CenterVertically) {
+                thumbnail()
+                Column(Modifier.weight(1f).padding(start = 16.dp, end = 16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Text(asset.name, maxLines = 1, overflow = TextOverflow.Ellipsis,
+                        style = if (rowHeight < 52.dp) MaterialTheme.typography.bodyMedium else MaterialTheme.typography.titleSmall)
+                    if (rowHeight >= 52.dp) Text(information, style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
             }
         }
     }
@@ -2077,11 +2239,15 @@ class MainActivity : ComponentActivity() {
         var editFolders by remember(asset.id) { mutableStateOf(false) }
         var editName by remember(asset.id) { mutableStateOf(false) }
         var checkerboard by remember { mutableStateOf(getSharedPreferences("viewer", MODE_PRIVATE).getBoolean("checkerboard", false)) }
-        val metadata by produceState<JSONObject?>(null, asset.id, asset.mtime, detailsOpen) {
-            value = if (!detailsOpen) null else withContext(Dispatchers.IO) {
-                runCatching { JSONObject(String(readAssetFile(asset.id, "metadata.json"), StandardCharsets.UTF_8)) }.getOrNull()
+        val metadataResult by key(asset.id, asset.mtime, detailsOpen) {
+            produceState<Result<JSONObject>?>(null) {
+                if (detailsOpen) value = withContext(Dispatchers.IO) {
+                    runCatching { JSONObject(String(readAssetFile(asset.id, "metadata.json"), StandardCharsets.UTF_8)) }
+                }
             }
         }
+        val metadata = metadataResult?.getOrNull()
+        val paletteLoading = detailsOpen && metadataResult == null
         val colors = remember(metadata) { metadata?.let(LibraryLogic::paletteColors).orEmpty() }
         fun date(field: String): String {
             val time = metadata?.optLong(field) ?: 0L
@@ -2182,12 +2348,18 @@ class MainActivity : ComponentActivity() {
                 Row(Modifier.fillMaxWidth().height(48.dp).padding(start = 16.dp), verticalAlignment = Alignment.CenterVertically) {
                     Text("素材详情", Modifier.weight(1f), style = MaterialTheme.typography.titleMedium)
                 }
-                if (colors.isNotEmpty()) Row(Modifier.padding(start = 16.dp, end = 16.dp, bottom = 8.dp)
-                    .border(1.dp, MaterialTheme.colorScheme.outlineVariant, CircleShape)
-                    .horizontalScroll(rememberScrollState()).padding(horizontal = 10.dp, vertical = 8.dp), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    colors.forEach { color ->
-                        Box(Modifier.size(18.dp).background(androidx.compose.ui.graphics.Color(color), CircleShape)
-                            .border(1.dp, MaterialTheme.colorScheme.outlineVariant, CircleShape))
+                Box(Modifier.fillMaxWidth().height(42.dp).padding(start = 16.dp, end = 16.dp, bottom = 8.dp)) {
+                    if (paletteLoading || colors.isNotEmpty()) Row(Modifier
+                        .border(1.dp, MaterialTheme.colorScheme.outlineVariant, CircleShape)
+                        .horizontalScroll(rememberScrollState()).padding(horizontal = 10.dp, vertical = 8.dp)
+                        .semantics { contentDescription = if (paletteLoading) "主色加载中" else "素材主色" },
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        val swatches = if (paletteLoading) List(10) { androidx.compose.ui.graphics.Color.Gray.copy(alpha = .45f) }
+                            else colors.map { androidx.compose.ui.graphics.Color(it) }
+                        swatches.forEach { color ->
+                            Box(Modifier.size(18.dp).background(color, CircleShape)
+                                .border(1.dp, MaterialTheme.colorScheme.outlineVariant, CircleShape))
+                        }
                     }
                 }
                 Surface(onClick = { editName = true }, enabled = !batchBusy && source == LibrarySource.ONEDRIVE,
@@ -2228,7 +2400,7 @@ class MainActivity : ComponentActivity() {
                             if (LibraryLogic.isViewableImage(asset.ext)) loadDetailOriginal(asset) else openExternalFile(asset)
                         }
                     }
-                    val expandedPanelWidth = if (maxWidth < 700.dp) maxWidth - 36.dp else minOf(340.dp, maxWidth - 40.dp)
+                    val expandedPanelWidth = if (!LibraryLogic.usesSideInspector(maxWidth.value)) maxWidth - 36.dp else minOf(340.dp, maxWidth - 40.dp)
                     val panelWidth = animateDpAsState(if (detailsOpen) expandedPanelWidth else 40.dp,
                         tween(240), label = "detail-panel-width")
                     val availablePanelHeight = maxHeight -
@@ -2353,6 +2525,60 @@ class MainActivity : ComponentActivity() {
     }
 
     @Composable
+    private fun EditSelectionDialog(title: String, initial: String, canRename: Boolean, isFolder: Boolean, hasColor: Boolean, onDismiss: () -> Unit, onSave: (String?, String?, String?) -> Unit) {
+        var name by remember { mutableStateOf(initial) }
+        var color by remember { mutableStateOf<String?>(null) }
+        var icon by remember { mutableStateOf<String?>(null) }
+        var colorOpen by remember { mutableStateOf(false) }
+        var iconOpen by remember { mutableStateOf(false) }
+        val currentColor = if (isFolder) flatFolderTree.firstOrNull { it.id in selectedFolderIds }?.iconColor.orEmpty()
+            else tagGroups.firstOrNull { it.optString("id") in selectedTagGroupIds }?.optString("color").orEmpty()
+        val currentIcon = if (isFolder) selectedFolderIds.firstOrNull()?.let { storedFolderIcon(it) }.orEmpty() else ""
+        val valid = runCatching { if (title.contains("标签")) LibraryLogic.validTagName(name) else LibraryLogic.validName(name) }.isSuccess
+        AlertDialog(onDismissRequest = onDismiss, title = { Text(title) }, text = { Column {
+            if (canRename) OutlinedTextField(name, { name = it }, label = { Text("名称") }, singleLine = true, isError = !valid, modifier = Modifier.fillMaxWidth())
+            else Text("已选择多项")
+            if (isFolder) Row(Modifier.fillMaxWidth().heightIn(min = 48.dp), verticalAlignment = Alignment.CenterVertically) {
+                Text("图标", Modifier.weight(1f)); Box {
+                    IconButton(onClick = { iconOpen = true }) { FolderIcon(icon ?: currentIcon, tagGroupColor(color ?: currentColor), Modifier.size(24.dp)) }
+                }
+            }
+            if (hasColor) Row(Modifier.fillMaxWidth().heightIn(min = 48.dp), verticalAlignment = Alignment.CenterVertically) {
+                Text("颜色", Modifier.weight(1f)); Box {
+                    IconButton(onClick = { colorOpen = true }) { Box(Modifier.size(22.dp).background(tagGroupColor(color ?: currentColor), CircleShape).border(1.dp, MaterialTheme.colorScheme.outlineVariant, CircleShape)) }
+                    androidx.compose.material3.DropdownMenu(colorOpen, { colorOpen = false }) {
+                        LibraryLogic.ICON_COLORS.forEach { value ->
+                            val label = when (value) { "" -> "默认"; "red" -> "红色"; "orange" -> "橙色"; "yellow" -> "黄色"; "green" -> "绿色"; "aqua" -> "青色"; "blue" -> "蓝色"; "purple" -> "紫色"; "pink" -> "粉色"; else -> "灰色" }
+                            DropdownMenuItem(text = { Text(label) }, leadingIcon = { Box(Modifier.size(18.dp).background(tagGroupColor(value), CircleShape)) }, onClick = { color = value; colorOpen = false })
+                        }
+                    }
+                }
+            }
+        } }, confirmButton = { TextButton(onClick = { onSave(name.trim().takeIf { canRename && it != initial }, color, icon) }, enabled = !canRename || valid) { Text("保存") } },
+            dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } })
+        if (iconOpen) AlertDialog(onDismissRequest = { iconOpen = false }, title = { Text("选择文件夹图标") },
+            text = { LazyVerticalGrid(columns = GridCells.Adaptive(44.dp), modifier = Modifier.fillMaxWidth().heightIn(max = 360.dp)) {
+                items(FolderIcons.choices, key = { it.id }) { choice ->
+                    IconButton(onClick = { icon = choice.id; iconOpen = false }) {
+                        Box(Modifier.size(32.dp).background(if (choice.id == FolderIcons.normalize(icon ?: currentIcon)) MaterialTheme.colorScheme.secondaryContainer else androidx.compose.ui.graphics.Color.Transparent, RoundedCornerShape(8.dp))) {
+                            Box(Modifier.align(Alignment.Center)) { FolderIcon(choice.id, tagGroupColor(color ?: currentColor), Modifier.size(24.dp), choice.label) }
+                        }
+                    }
+                }
+            } }, confirmButton = { TextButton(onClick = { iconOpen = false }) { Text("取消") } })
+    }
+
+    private fun storedFolderIcon(id: String): String = flatFolderTree.firstOrNull { it.id == id }?.icon.orEmpty()
+
+    @Composable
+    private fun FolderIcon(icon: String, tint: androidx.compose.ui.graphics.Color, modifier: Modifier, description: String? = null) {
+        val choice = FolderIcons.choice(icon)
+        if (choice != null && choice.drawable == 0) Box(modifier, contentAlignment = Alignment.Center) {
+            Text(choice.label, color = tint, style = MaterialTheme.typography.labelLarge)
+        } else Icon(painterResource(choice?.drawable ?: R.drawable.ic_folder_24), description, modifier, tint = tint)
+    }
+
+    @Composable
     private fun NameDialog(title: String, initial: String, onDismiss: () -> Unit, onSave: (String) -> Unit) {
         var name by remember { mutableStateOf(initial) }
         val valid = runCatching { if (title.contains("标签")) LibraryLogic.validTagName(name) else LibraryLogic.validName(name) }.isSuccess
@@ -2367,8 +2593,8 @@ class MainActivity : ComponentActivity() {
     private fun TagPicker(initial: List<String>, onDismiss: () -> Unit, onSave: (List<String>) -> Unit) {
         var selected by remember { mutableStateOf(initial.toSet()) }
         var query by remember { mutableStateOf("") }
-        val available = remember(indexedAssets, tagGroups, selected) {
-            (indexedAssets.flatMap { it.tags } + tagGroups.flatMap { group ->
+        val available = remember(indexedAssets, tagGroups, libraryTags, selected) {
+            (libraryTags + indexedAssets.flatMap { it.tags } + tagGroups.flatMap { group ->
                 val tags = group.optJSONArray("tags") ?: JSONArray()
                 (0 until tags.length()).map { tags.optString(it) }
             } + selected).filter { it.isNotBlank() }.distinct().sortedWith(String.CASE_INSENSITIVE_ORDER)
@@ -2413,26 +2639,138 @@ class MainActivity : ComponentActivity() {
         if (batchBusy || !canUpload()) return
         val ids = selectedFolderIds
         val expected = folderPositions(folderTree)
-        batchBusy = true
-        queueEdit {
-            val result = runCatching {
-                val metadata = mutateLibraryNow {
-                    val current = folderPositions(parseFolders(it.getJSONArray("folders")))
-                    if (ids.any { id -> current[id] != expected[id] }) throw LibraryConflict()
-                    LibraryLogic.changeFolders(it, ids, parentId, name)
-                }
-                parseFolders(metadata.getJSONArray("folders"))
-            }
-            runOnUiThread {
-                batchBusy = false
-                result.onSuccess { nodes -> folderTree = nodes; selectedFolderName = allFolders(nodes).firstOrNull { it.id == selectedFolderId }?.name ?: selectedFolderName; clearSelection() }
-                    .onFailure { Toast.makeText(this, "目录修改失败：${it.message}", Toast.LENGTH_LONG).show() }
-            }
+        editLibraryStructure("移动文件夹") { metadata ->
+            val current = folderPositions(parseFolders(metadata.getJSONArray("folders")))
+            if (ids.any { current[it] != expected[it] }) throw LibraryConflict()
+            LibraryLogic.changeFolders(metadata, ids, parentId, name)
         }
     }
 
     private fun folderPositions(nodes: List<FolderNode>, parent: String? = null): Map<String, Pair<String, String?>> = buildMap {
         nodes.forEach { node -> put(node.id, node.name to parent); putAll(folderPositions(node.children, node.id)) }
+    }
+
+    private fun structureSnapshot(): JSONObject {
+        fun folder(node: FolderNode): JSONObject = JSONObject().put("id", node.id).put("name", node.name)
+            .put("icon", node.icon).put("iconColor", node.iconColor).put("children", JSONArray(node.children.map(::folder)))
+        return JSONObject().put("folders", JSONArray(folderTree.map(::folder)))
+            .put("tagsGroups", JSONArray(tagGroups.map { JSONObject(it.toString()) })).put("tags", JSONArray(libraryTags))
+    }
+
+    private fun applyStructureMetadata(metadata: JSONObject) {
+        folderTree = parseFolders(metadata.optJSONArray("folders") ?: JSONArray())
+        tagGroups = LibraryLogic.tagGroups(metadata)
+        libraryTags = jsonStrings(metadata, "tags")
+        val folders = allFolders(folderTree).associateBy { it.id }
+        val groups = tagGroups.associateBy { it.optString("id") }
+        fun name(section: LibrarySection, folder: String?, tag: String?, fallback: String) = when (section) {
+            LibrarySection.FOLDER -> folders[folder]?.name ?: fallback
+            LibrarySection.TAGGROUP -> groups[tag]?.optString("name") ?: fallback
+            else -> fallback
+        }
+        selectedFolderName = name(selectedSection, selectedFolderId, selectedTag, selectedFolderName)
+        browseHistory = browseHistory.map { it.copy(name = name(it.section, it.folderId, it.tag, it.name)) }
+    }
+
+    private fun editLibraryStructure(label: String, mutate: (JSONObject) -> Unit) {
+        if (batchBusy || !canUpload()) return
+        if (tagRenameFile().baseFile.exists()) {
+            Toast.makeText(this, "请先在设置中完成批量编辑任务", Toast.LENGTH_LONG).show()
+            return
+        }
+        val before = structureSnapshot()
+        val preview = runCatching { JSONObject(before.toString()).also(mutate) }
+        if (preview.isFailure) {
+            Toast.makeText(this, "更改失败：" + preview.exceptionOrNull()?.message, Toast.LENGTH_LONG).show()
+            return
+        }
+        applyStructureMetadata(preview.getOrThrow())
+        clearSelection()
+        categorySavePending = true
+        batchBusy = true
+        Toast.makeText(this, "正在后台保存，可继续浏览", Toast.LENGTH_SHORT).show()
+        queueEdit {
+            val result = runCatching { mutateLibraryNow(mutate) }
+            runOnUiThread {
+                batchBusy = false
+                categorySavePending = false
+                result.onSuccess {
+                    applyStructureMetadata(it)
+                    Toast.makeText(this, "已更改成功", Toast.LENGTH_SHORT).show()
+                }.onFailure {
+                    applyStructureMetadata(before)
+                    Toast.makeText(this, "更改失败，已恢复原来的样式：" + it.message, Toast.LENGTH_LONG).show()
+                }
+            }
+        }
+    }
+
+    private fun saveCategoryEdit(name: String?, color: String?, icon: String?) {
+        val folders = selectedFolderIds.toSet()
+        val groups = selectedTagGroupIds.toSet()
+        if (selectedTags.isNotEmpty()) {
+            if (name != null) renameTagSelection(name) else clearSelection()
+            return
+        }
+        if (name == null && color == null && icon == null) { clearSelection(); return }
+        val expected = folderPositions(folderTree)
+        val groupId = groups.singleOrNull()
+        val expectedGroupName = tagGroups.firstOrNull { it.optString("id") == groupId }?.optString("name")
+        editLibraryStructure("保存") { metadata ->
+            if (folders.isNotEmpty()) {
+                val current = folderPositions(parseFolders(metadata.getJSONArray("folders")))
+                if (folders.any { current[it] != expected[it] }) throw LibraryConflict()
+                if (name != null) LibraryLogic.changeFolders(metadata, folders, null, name)
+                if (color != null) LibraryLogic.setFolderColors(metadata, folders, color)
+                if (icon != null) LibraryLogic.setFolderIcons(metadata, folders, icon)
+            } else {
+                if (name != null && groupId != null) {
+                    if (LibraryLogic.tagGroups(metadata).firstOrNull { it.optString("id") == groupId }?.optString("name") != expectedGroupName) throw LibraryConflict()
+                    LibraryLogic.renameTagGroup(metadata, groupId, name)
+                }
+                if (color != null) LibraryLogic.setTagGroupColors(metadata, groups, color)
+            }
+        }
+    }
+
+    @Composable
+    private fun TagGroupPickerDialog() {
+        val tags = selectedTags.toSet()
+        AlertDialog(onDismissRequest = { moveTagsOpen = false }, title = { Text("移动 ${tags.size} 个标签到群组") }, text = {
+            LazyColumn(Modifier.heightIn(max = 380.dp)) {
+                item { DropdownMenuItem(text = { Text("未分组") }, onClick = {
+                    moveTagsOpen = false; editLibraryStructure("移动标签") { LibraryLogic.moveTags(it, tags, null) }
+                }) }
+                items(tagGroups, key = { it.getString("id") }) { group ->
+                    DropdownMenuItem(text = { Text(group.getString("name")) },
+                        leadingIcon = { Icon(painterResource(R.drawable.ic_bookmark_24), null, tint = tagGroupColor(group.optString("color"))) }, onClick = {
+                            val target = group.getString("id")
+                            moveTagsOpen = false; editLibraryStructure("移动标签") { LibraryLogic.moveTags(it, tags, target) }
+                        })
+                }
+            }
+        }, confirmButton = { TextButton(onClick = { moveTagsOpen = false }) { Text("取消") } })
+    }
+
+    @Composable
+    private fun DeleteFoldersDialog() {
+        var recycle by remember { mutableStateOf(false) }
+        AlertDialog(onDismissRequest = { deleteFoldersCandidate = emptySet() }, title = { Text("删除 ${deleteFoldersCandidate.size} 个文件夹？") }, text = {
+            Column {
+                Text("会删除选中文件夹及其子文件夹，文件夹结构无法直接还原。请选择素材的处理方式：")
+                listOf(false to "只删除文件夹，保留素材", true to "同时将其中的素材移到回收站").forEach { (value, label) ->
+                    Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).clickable { recycle = value }, verticalAlignment = Alignment.CenterVertically) {
+                        androidx.compose.material3.RadioButton(recycle == value, onClick = null)
+                        Text(label, Modifier.padding(start = 12.dp))
+                    }
+                }
+                Text(if (recycle) "包括子文件夹内的素材；即使还归属其他文件夹，也会进入回收站。不会永久删除原文件。" else "素材仍在其他所属文件夹中；没有其他分类的素材会显示为未分类。", style = MaterialTheme.typography.bodySmall)
+            }
+        }, confirmButton = { TextButton(onClick = {
+            val selected = deleteFoldersCandidate
+            deleteFoldersCandidate = emptySet()
+            runTagRename(deleteFolders = selected, recycleFolderAssets = recycle)
+        }, enabled = !batchBusy && canUpload()) { Text("删除文件夹") } }, dismissButton = { TextButton(onClick = { deleteFoldersCandidate = emptySet() }) { Text("取消") } })
     }
 
     private fun mutateJsonFile(relative: String, merge: Boolean = false, mutate: (JSONObject) -> Unit): JsonChange {
@@ -2671,7 +3009,7 @@ class MainActivity : ComponentActivity() {
     }
 
     @Composable
-    private fun FolderPicker(initial: Set<String>, multiple: Boolean, onDismiss: () -> Unit, rootLabel: String = "未分类", onConfirm: (Set<String>) -> Unit) {
+    private fun FolderPicker(initial: Set<String>, multiple: Boolean, onDismiss: () -> Unit, rootLabel: String = "未分类", excluded: Set<String> = emptySet(), onConfirm: (Set<String>) -> Unit) {
         var selected by remember { mutableStateOf(initial) }
         var expanded by remember { mutableStateOf(emptySet<String>()) }
         AlertDialog(
@@ -2685,8 +3023,8 @@ class MainActivity : ComponentActivity() {
                             onConfirm(selected)
                         }, trailingIcon = { if (selected.isEmpty()) Icon(Icons.Default.Check, contentDescription = "已选中") })
                     }
-                    items(flattenVisibleFolders(folderTree, expanded), key = { it.node.id }) { row ->
-                        FolderMenuItem(row, expanded, selected,
+                    items(flattenVisibleFolders(folderTree, expanded).filterNot { it.node.id in excluded }, key = { it.node.id }) { row ->
+                        FolderMenuItem(row, expanded = expanded, selected = selected,
                             onExpand = { id -> expanded = if (id in expanded) expanded - id else expanded + id },
                             onSelect = { id ->
                                 selected = if (!multiple) setOf(id) else if (id in selected) selected - id else selected + id
@@ -2728,44 +3066,109 @@ class MainActivity : ComponentActivity() {
     }
 
     @Composable
-    private fun SettingsScreen() {
+    private fun SettingsScreen(modifier: Modifier = Modifier) {
         val focusManager = LocalFocusManager.current
         val keyboard = LocalSoftwareKeyboardController.current
-        Scaffold(
-            topBar = { CompactTitleBar("设置") }
-        ) { padding ->
-            BoxWithConstraints(Modifier.fillMaxSize().padding(padding).pointerInput(Unit) {
-                detectTapGestures {
-                    focusManager.clearFocus()
-                    keyboard?.hide()
-                }
-            }) {
-                val wide = maxWidth >= 840.dp
-                Column(
-                    Modifier.fillMaxSize().navigationBarsPadding().verticalScroll(rememberScrollState())
-                        .padding(start = 16.dp, top = 8.dp, end = 16.dp, bottom = 104.dp),
-                    verticalArrangement = Arrangement.spacedBy(12.dp)
-                ) {
-                    if (wide) {
-                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(16.dp)) {
-                            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                                SettingsLibraries()
-                                SettingsIndexUpdate()
-                            }
-                            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                                SettingsCache()
-                                SettingsAbout()
-                            }
+        BoxWithConstraints(modifier.fillMaxSize().background(MaterialTheme.colorScheme.background).statusBarsPadding().pointerInput(Unit) {
+            detectTapGestures {
+                focusManager.clearFocus()
+                keyboard?.hide()
+            }
+        }) {
+            val wide = maxWidth >= 840.dp
+            Column(
+                Modifier.fillMaxSize().verticalScroll(rememberScrollState())
+                    .padding(start = 16.dp, top = 8.dp, end = 16.dp, bottom = 104.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                if (wide) {
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(16.dp)) {
+                        Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                            SettingsLibraries()
+                            SettingsIndexUpdate()
                         }
-                    } else {
-                        SettingsLibraries()
-                        SettingsIndexUpdate()
-                        SettingsCache()
-                        SettingsAbout()
+                        Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                            SettingsCache()
+                            SettingsAppearance()
+                            SettingsAbout()
+                        }
                     }
+                } else {
+                    SettingsLibraries()
+                    SettingsIndexUpdate()
+                    SettingsCache()
+                    SettingsAppearance()
+                    SettingsAbout()
                 }
             }
         }
+    }
+
+    @Composable
+    private fun SettingsAppearance() {
+        var colorTarget by remember { mutableStateOf<String?>(null) }
+        val modes = listOf(0 to "跟随系统", 1 to "深色", 2 to "浅色")
+        Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            Box(Modifier.height(48.dp), contentAlignment = Alignment.CenterStart) { Text("外观", style = MaterialTheme.typography.titleMedium) }
+            Card(Modifier.fillMaxWidth(), shape = RoundedCornerShape(24.dp), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerHigh)) {
+                ListItem(colors = ListItemDefaults.colors(containerColor = androidx.compose.ui.graphics.Color.Transparent),
+                    headlineContent = { Text("明暗模式") }, trailingContent = {
+                        IconButton(onClick = { themeMode = (themeMode + 1) % 3; saveViewerPreferences(); Toast.makeText(this@MainActivity, modes.first { it.first == themeMode }.second, Toast.LENGTH_SHORT).show() }) {
+                            Icon(painterResource(when (themeMode) { 1 -> R.drawable.ic_dark_mode_24; 2 -> R.drawable.ic_light_mode_24; else -> R.drawable.ic_brightness_auto_24 }), "当前" + modes.first { it.first == themeMode }.second + "，点按切换", Modifier.size(22.dp))
+                        }
+                    })
+                HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+                ListItem(colors = ListItemDefaults.colors(containerColor = androidx.compose.ui.graphics.Color.Transparent),
+                    headlineContent = { Text("颜色") }, trailingContent = {
+                        Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                            listOf("主题色", "强调色").forEach { title ->
+                                val value = if (title == "主题色") themeColor else accentColor
+                                val color = if (value == "wallpaper") {
+                                    if (title == "主题色") MaterialTheme.colorScheme.background else MaterialTheme.colorScheme.primary
+                                } else AppColors.seed(value)
+                                IconButton(onClick = { colorTarget = title }) {
+                                    Box(Modifier.size(22.dp).background(color, CircleShape)
+                                        .border(1.dp, MaterialTheme.colorScheme.outlineVariant, CircleShape)
+                                        .semantics { contentDescription = "选择$title" })
+                                }
+                            }
+                        }
+                    })
+            }
+        }
+        colorTarget?.let { target -> key(target) {
+            val current = if (target == "主题色") themeColor else accentColor
+            var selectedColor by remember { mutableStateOf(current) }
+            fun applyColor() {
+                if (target == "主题色") themeColor = selectedColor else accentColor = selectedColor
+                saveViewerPreferences(); colorTarget = null
+            }
+            AlertDialog(onDismissRequest = { colorTarget = null }, title = { Text("选择$target") },
+                text = { Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    AppColors.presets.chunked(4).forEach { row ->
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            row.forEach { (name, value) ->
+                                val chosen = selectedColor != "wallpaper" && AppColors.seed(selectedColor) == AppColors.seed(value)
+                                Surface(onClick = { selectedColor = value },
+                                    modifier = Modifier.weight(1f).semantics { selected = chosen },
+                                    shape = RoundedCornerShape(12.dp),
+                                    color = androidx.compose.ui.graphics.Color.Transparent,
+                                    border = androidx.compose.foundation.BorderStroke(if (chosen) 2.dp else 1.dp,
+                                        if (chosen) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outlineVariant)) {
+                                    Column(Modifier.padding(vertical = 12.dp), horizontalAlignment = Alignment.CenterHorizontally,
+                                        verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                        Box(Modifier.size(28.dp).background(AppColors.seed(value), CircleShape)
+                                            .border(1.dp, MaterialTheme.colorScheme.outlineVariant, CircleShape))
+                                        Text(name, style = MaterialTheme.typography.labelMedium)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    TextButton(onClick = { selectedColor = "wallpaper" }, modifier = Modifier.semantics { selected = selectedColor == "wallpaper" }) { Text("跟随壁纸") }
+                } }, confirmButton = { TextButton(onClick = ::applyColor) { Text("应用") } },
+                dismissButton = { TextButton(onClick = { colorTarget = null }) { Text("取消") } })
+        } }
     }
 
     @Composable
@@ -2989,7 +3392,7 @@ class MainActivity : ComponentActivity() {
                     if (pendingRename != null || tagRenameStatus.isNotBlank()) {
                         Card(Modifier.fillMaxWidth()) {
                             Column(Modifier.padding(16.dp)) {
-                                Text("标签编辑任务", style = MaterialTheme.typography.titleMedium)
+                                Text("批量编辑任务", style = MaterialTheme.typography.titleMedium)
                                 Text(tagRenameStatus.ifBlank { "已处理 ${pendingRename!!.done.size}/${pendingRename.ids.size} 项，进度已保存" })
                                 if (pendingRename != null) TextButton(onClick = { runTagRename() }, enabled = !batchBusy && canUpload()) { Text("继续处理") }
                             }
@@ -3081,7 +3484,7 @@ class MainActivity : ComponentActivity() {
                                 })
                         }
                     }
-                    if (uploadCandidates.isNotEmpty()) Text("已接收 ${uploadCandidates.size} 张待上传图片，请打开可写的本地库或连接 OneDrive、SMB、WebDAV 库。", modifier = Modifier.padding(8.dp))
+                    if (uploadCandidates.isNotEmpty()) Text("已接收 ${uploadCandidates.size} 个待上传素材，请打开可写素材库。", modifier = Modifier.padding(8.dp))
                     }
     }
 
@@ -3235,19 +3638,6 @@ class MainActivity : ComponentActivity() {
             },
             dismissButton = { TextButton(onClick = { editLibraryCandidate = null }) { Text("取消") } }
         )
-    }
-
-    @Composable
-    private fun CompactTitleBar(title: String) {
-        Surface(color = MaterialTheme.colorScheme.surface) {
-            Row(
-                Modifier.fillMaxWidth().statusBarsPadding().heightIn(min = 44.dp, max = 44.dp)
-                    .padding(horizontal = 16.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text(title, style = MaterialTheme.typography.titleLarge)
-            }
-        }
     }
 
     @Composable
@@ -3685,7 +4075,7 @@ class MainActivity : ComponentActivity() {
         val cachedGroups = runCatching { LibraryLogic.tagGroups(cachedMetadata) }.getOrDefault(emptyList())
         runOnUiThread {
             folderTree = cachedFolders
-            tagGroups = cachedGroups
+            tagGroups = cachedGroups; libraryTags = jsonStrings(cachedMetadata, "tags")
             expandedTagGroups = emptySet()
             tagManagerOpen = false
             expandedFolderIds = emptySet()
@@ -3898,7 +4288,7 @@ class MainActivity : ComponentActivity() {
                 if (save) saveLibrary()
                 runOnUiThread {
                     folderTree = folders
-                    tagGroups = groups
+                    tagGroups = groups; libraryTags = jsonStrings(metadata, "tags")
                     if (resetNavigation) {
                         expandedFolderIds = emptySet()
                         folderGroupOpen = false
@@ -4203,8 +4593,10 @@ class MainActivity : ComponentActivity() {
         LibraryLogic.thumbnailCacheKey(libraryId.orEmpty(), asset.id, asset.mtime)
     )
 
+    private fun closeSettings() { settingsOpen = false; searchOpen = searchQuery.isNotBlank() }
+
     private fun openSettings() {
-        if (batchBusy) {
+        if (batchBusy && !categorySavePending) {
             Toast.makeText(this, "请等待当前批量操作完成", Toast.LENGTH_SHORT).show()
             return
         }
@@ -4465,13 +4857,13 @@ class MainActivity : ComponentActivity() {
         val folderNames = flatFolderTree.filter { it.id in folderIds }.map { it.name }
         AlertDialog(
             onDismissRequest = { uploadCandidates = emptyList() },
-            title = { Text("上传 ${uploadCandidates.size} 张图片") },
+            title = { Text("上传 ${uploadCandidates.size} 个素材") },
             text = {
                 Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                     Text("素材库：${libraryName.orEmpty()}")
                     InspectorSection("标签", tags, true) { tagMenu = true }
                     InspectorSection("文件夹", folderNames, true) { folderMenu = true }
-                    Text("保留原文件；手机生成缩略图和元数据。仅支持系统可解码的图片，单张最多 200 MB。失败任务保留，可手动重试。", style = MaterialTheme.typography.bodySmall)
+                    Text("保留原文件；手机生成缩略图和元数据。支持图片、视频、音频和文档，单个最多 200 MB；无法预览的文件保留原件。失败任务保留，可手动重试。", style = MaterialTheme.typography.bodySmall)
                 }
             },
             confirmButton = {
@@ -4514,7 +4906,7 @@ class MainActivity : ComponentActivity() {
         val id = UploadLogic.newId()
         val displayName = contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use {
             if (it.moveToFirst()) it.getString(0) else null
-        } ?: error("无法读取图片名称")
+        } ?: error("无法读取素材名称")
         val fileName = UploadLogic.safeFileName(displayName)
         val job = File(uploadRoot(), id)
         check(job.mkdirs())
@@ -4529,25 +4921,22 @@ class MainActivity : ComponentActivity() {
                         val count = input.read(buffer)
                         if (count < 0) break
                         total += count
-                        check(total <= 200L * 1024 * 1024) { "单张图片不能超过 200 MB" }
+                        check(total <= 200L * 1024 * 1024) { "单个素材不能超过 200 MB" }
                         output.write(buffer, 0, count)
                     }
                 }
-            } ?: error("无法读取选中的图片")
-            check(original.length() > 0) { "图片文件为空" }
-            var width = 0
-            var height = 0
-            val bitmap = ImageDecoder.decodeBitmap(ImageDecoder.createSource(original)) { decoder, info, _ ->
-                width = info.size.width
-                height = info.size.height
-                decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
-                val sample = ((maxOf(width, height) + 599) / 600).coerceAtLeast(1)
-                decoder.setTargetSampleSize(sample)
+            } ?: error("无法读取选中的素材")
+            check(original.length() > 0) { "素材文件为空" }
+            val preview = UploadPreview.read(original, fileName.substringAfterLast('.'))
+            preview.bitmap?.let { bitmap ->
+                try {
+                    File(job, "thumbnail.png").outputStream().use { check(bitmap.compress(Bitmap.CompressFormat.PNG, 100, it)) }
+                } finally { bitmap.recycle() }
             }
-            try {
-                File(job, "thumbnail.png").outputStream().use { check(bitmap.compress(Bitmap.CompressFormat.PNG, 100, it)) }
-            } finally { bitmap.recycle() }
-            File(job, "metadata.json").writeText(UploadLogic.metadata(id, fileName, original.length(), width, height, now, folderIds, tags).toString())
+            val metadata = UploadLogic.metadata(id, fileName, original.length(), preview.width, preview.height, now, folderIds, tags)
+                .put("noThumbnail", preview.bitmap == null)
+            if (preview.duration > 0) metadata.put("duration", preview.duration)
+            File(job, "metadata.json").writeText(metadata.toString())
             saveUploadState(job, JSONObject().put("ready", true).put("id", id).put("fileName", fileName)
                 .put("source", source.name).put("libraryId", libraryId).put("driveId", driveId).put("mtime", now))
             return job
@@ -4586,7 +4975,7 @@ class MainActivity : ComponentActivity() {
                 }
             } catch (error: Throwable) { lastFailure = error } finally {
                 stopService(Intent(this, IndexingService::class.java))
-                val message = "上传完成 $succeeded 张" + if (failed > 0 || lastFailure != null) "；部分未完成，可重试。${lastFailure?.message.orEmpty().take(180)}" else ""
+                val message = "上传完成 $succeeded 个素材" + if (failed > 0 || lastFailure != null) "；部分未完成，可重试。${lastFailure?.message.orEmpty().take(180)}" else ""
                 runOnUiThread {
                     batchBusy = false
                     uploadMessage = message
@@ -4630,7 +5019,7 @@ class MainActivity : ComponentActivity() {
         }
         if (!state.optBoolean("thumbnailDone")) {
             val thumbName = fileName.substringBeforeLast('.') + "_thumbnail.png"
-            retry(3) { graphPut(assetFile(id, thumbName), File(job, "thumbnail.png").readBytes()) }
+            if (File(job, "thumbnail.png").isFile) retry(3) { graphPut(assetFile(id, thumbName), File(job, "thumbnail.png").readBytes()) }
             state.put("thumbnailDone", true)
             saveUploadState(job, state)
         }
@@ -4672,7 +5061,7 @@ class MainActivity : ComponentActivity() {
             saveUploadState(job, state)
         }
         if (!state.optBoolean("thumbnailDone")) {
-            retry(3) { uploadStagedFile(id, fileName.substringBeforeLast('.') + "_thumbnail.png", File(job, "thumbnail.png"), state, job) }
+            if (File(job, "thumbnail.png").isFile) retry(3) { uploadStagedFile(id, fileName.substringBeforeLast('.') + "_thumbnail.png", File(job, "thumbnail.png"), state, job) }
             state.put("thumbnailDone", true)
             saveUploadState(job, state)
         }
@@ -4818,7 +5207,8 @@ class MainActivity : ComponentActivity() {
                 json.getString("id"),
                 json.getString("name"),
                 parseFolders(json.optJSONArray("children") ?: JSONArray()),
-                json.optString("iconColor")
+                json.optString("iconColor"),
+                json.optString("icon")
             ))
         }
     }
@@ -5241,7 +5631,7 @@ class MainActivity : ComponentActivity() {
                 runCatching { JSONObject(File(job, "state.json").readText()).optString("libraryId")
                     .let { it in setOf(saved.id, target.id) } }.getOrDefault(true)
             }) {
-            Toast.makeText(this, "请先完成未完成的上传或标签修改", Toast.LENGTH_LONG).show()
+            Toast.makeText(this, "请先完成未完成的上传或批量编辑", Toast.LENGTH_LONG).show()
             return
         }
         remoteConnecting = true
@@ -5378,7 +5768,7 @@ class MainActivity : ComponentActivity() {
                 resetBrowseHistory()
                 indexedAssets = emptyList()
                 folderTree = emptyList()
-                tagGroups = emptyList()
+                tagGroups = emptyList(); libraryTags = emptyList()
                 getSharedPreferences("library", MODE_PRIVATE).edit()
                     .remove("driveId").remove("libraryId").remove("libraryName")
                     .remove("localUri").remove("webDavUrl").remove("webDavUser").apply()
@@ -5423,7 +5813,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private data class CloudFolder(val id: String?, val name: String)
-    private data class FolderNode(val id: String, val name: String, val children: List<FolderNode>, val iconColor: String = "")
+    private data class FolderNode(val id: String, val name: String, val children: List<FolderNode>, val iconColor: String = "", val icon: String = "")
     private data class FolderRow(val node: FolderNode, val depth: Int)
     private data class FolderChoice(val id: String, val label: String)
     private data class DevicePrompt(val code: String, val uri: String)

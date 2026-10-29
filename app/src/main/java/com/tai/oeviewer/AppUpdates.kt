@@ -57,8 +57,7 @@ internal fun newerAppRelease(releases: JSONArray, currentVersion: String): AppRe
                 (it.optString("digest").isBlank() || Regex("sha256:[0-9a-f]{64}").matches(it.optString("digest")))
         } ?: return@mapNotNull null
         if (release.optBoolean("draft") || compareVersions(parts, current) <= 0 ||
-            page != "$APP_REPOSITORY/releases/tag/$version" ||
-            !(0 until assets.length()).any { assets.getJSONObject(it).optString("name").endsWith(".apk", true) }) return@mapNotNull null
+            page != "$APP_REPOSITORY/releases/tag/$version") return@mapNotNull null
         AppRelease(version, release.optString("body").take(4000), page,
             apk.getString("browser_download_url"), apk.getLong("size"), apk.optString("digest"))
     }.maxWithOrNull { a, b -> compareVersions(versionParts(a.version)!!, versionParts(b.version)!!) }

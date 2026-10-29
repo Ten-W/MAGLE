@@ -43,9 +43,9 @@ final class UploadLogic {
         if (safe.endsWith(".")) safe = safe.substring(0, safe.length() - 1);
         if (safe.length() > 160) throw new IllegalArgumentException("文件名过长，请先重命名");
         int dot = safe.lastIndexOf('.');
-        if (dot <= 0 || dot == safe.length() - 1) throw new IllegalArgumentException("图片文件需要扩展名");
+        if (dot <= 0 || dot == safe.length() - 1) throw new IllegalArgumentException("素材文件需要扩展名");
         if (safe.substring(0, dot).replace(".", "").isEmpty())
-            throw new IllegalArgumentException("图片名称无效");
+            throw new IllegalArgumentException("素材名称无效");
         return safe.substring(0, dot) + "." + safe.substring(dot + 1).toLowerCase(java.util.Locale.ROOT);
     }
 
