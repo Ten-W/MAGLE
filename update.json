@@ -1,14 +1,14 @@
 [
   {
-    "tag_name": "v0.8.77",
-    "html_url": "https://github.com/Ten-W/MAGLE/releases/tag/v0.8.77",
-    "body": "精简正式版，约 7.1 MB。新增标签批量删除与二次确认，同时从素材属性移除标签，不删除素材文件；支持中断后继续处理。素材详情的颜色圆点增加胶囊边框。删除不可直接撤销，请避免其他设备同时编辑相关标签。沿用兼容签名，请覆盖更新，不要卸载。",
+    "tag_name": "v0.8.93",
+    "html_url": "https://github.com/Ten-W/MAGLE/releases/tag/v0.8.93",
+    "body": "MAGLE 0.8.93 精简正式包，适用于 Android 10 及以上。\n\n- 列表取消整行底色和阴影，文件名更大，图片与文字、格式和大小的间距更清晰。\n- 素材详情加载主色前显示灰色圆点占位，固定区域高度，避免信息突然跳动。\n- 外观提供 12 种预设颜色，含纯黑、纯白、红色等；主题色和强调色分别选择，支持深色模式纯黑背景。\n- 包含此前的目录固定与展开动画、分类编辑、底栏滑动切页、设置底部色带及代码整理改进。\n\n69 项单元检查通过，列表多选与返回在平板上检查通过。沿用兼容签名，请直接覆盖安装，不要先卸载。\n\n部分来源功能受服务权限与协议能力限制；S3 仍为 Beta。重要素材请保留备份。\n",
     "assets": [
       {
-        "name": "MAGLE-v0.8.77-release.apk",
-        "browser_download_url": "https://github.com/Ten-W/MAGLE/releases/download/v0.8.77/MAGLE-v0.8.77-release.apk",
-        "size": 7411985,
-        "digest": "sha256:bb8f75998b3309721c9c0e54bf68e0e665c78fddb4322b0d068cc36f54a36800"
+        "name": "MAGLE-v0.8.93-release.apk",
+        "browser_download_url": "https://github.com/Ten-W/MAGLE/releases/download/untagged-f2836f643a40b252c6aa/MAGLE-v0.8.93-release.apk",
+        "size": 7818901,
+        "digest": "sha256:008915972280830bff5602f1cac21d3173c2afb16650f846eaa0cb82f3928460"
       }
     ]
   }
