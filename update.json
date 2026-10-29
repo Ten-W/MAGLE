@@ -6,7 +6,7 @@
     "assets": [
       {
         "name": "MAGLE-v0.8.93-release.apk",
-        "browser_download_url": "https://github.com/Ten-W/MAGLE/releases/download/untagged-f2836f643a40b252c6aa/MAGLE-v0.8.93-release.apk",
+        "browser_download_url": "https://github.com/Ten-W/MAGLE/releases/download/v0.8.93/MAGLE-v0.8.93-release.apk",
         "size": 7818901,
         "digest": "sha256:008915972280830bff5602f1cac21d3173c2afb16650f846eaa0cb82f3928460"
       }
